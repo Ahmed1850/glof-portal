@@ -41,47 +41,35 @@ Optional: create `frontend/.env` with:
 VITE_API_URL=http://127.0.0.1:8000
 ```
 
-## Free hosting (recommended)
+## Free hosting (Render — recommended)
 
-| Layer | Service | Plan |
-|-------|---------|------|
-| API | [Render](https://render.com) Web Service | Free |
-| UI | [Vercel](https://vercel.com) or Render Static | Free |
+One free web service serves **both** the API and the React UI.
 
-### 1. Backend on Render
+### Deploy in ~5 minutes
 
-1. Push this repo to GitHub.
-2. [New Web Service](https://dashboard.render.com/select-repo?type=web) → select repo.
-3. Settings:
-   - **Root Directory:** `backend`
-   - **Runtime:** Python 3
-   - **Build:** `pip install -r requirements.txt`
-   - **Start:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-4. Environment variables:
-   - `SEED_ON_START` = `1`
-   - `DATABASE_URL` = `sqlite:////tmp/glof.db`
-   - `CORS_ORIGINS` = your frontend URL (e.g. `https://your-app.vercel.app`)
-5. Deploy → note the API URL (`https://….onrender.com`).
+1. Open: [Render → New Blueprint](https://dashboard.render.com/select-repo?type=blueprint)  
+   (or **New → Web Service** and connect this GitHub repo)
+2. Connect GitHub → select **`Ahmed1850/glof-portal`**
+3. Use the included `render.yaml` (or set manually):
+   - **Build command:**
+     ```
+     pip install -r backend/requirements.txt
+     cd frontend && npm install && VITE_API_URL= npm run build
+     mkdir -p ../backend/static && cp -r dist/* ../backend/static/
+     ```
+   - **Start command:** `cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+   - **Env vars:**
+     - `SEED_ON_START` = `1`
+     - `DATABASE_URL` = `sqlite:////tmp/glof.db`
+     - `PYTHON_VERSION` = `3.12.8`
+4. Create Web Service → wait for deploy → open `https://glof-portal-xxxx.onrender.com`
 
-> Free Render instances **spin down** after ~15 minutes idle. First request may take 30–60s.
+> Free instances **sleep after ~15 min idle**. First load after sleep can take 30–60 seconds.
 
-### 2. Frontend on Vercel
+### Optional: split UI on Vercel
 
-```bash
-cd frontend
-npx vercel --prod
-```
-
-Or import the GitHub repo in Vercel:
-
-- **Root Directory:** `frontend`
-- **Build Command:** `npm run build`
-- **Output:** `dist`
-- Env: `VITE_API_URL` = `https://your-api.onrender.com`
-
-### Blueprint deploy
-
-`render.yaml` defines both services. Import as a Blueprint and update `VITE_API_URL` / `CORS_ORIGINS` after first deploy.
+- **API** still on Render (`rootDir: backend`)
+- **UI** on Vercel with root `frontend` and env `VITE_API_URL=https://your-api.onrender.com`
 
 ## Features
 
