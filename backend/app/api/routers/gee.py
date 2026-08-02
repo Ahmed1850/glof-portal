@@ -9,6 +9,7 @@ from app.utils.gee_detection import (
     estimate_lake_exposure,
     get_historical_areas,
     get_lake_thumbnail,
+    gee_status,
 )
 
 limiter = Limiter(key_func=get_remote_address)
@@ -17,6 +18,19 @@ router = APIRouter(
     prefix="/gee",
     tags=["Google Earth Engine"]
 )
+
+
+def _gee_http_error(e: Exception) -> HTTPException:
+    msg = str(e)
+    code = 503 if "unavailable" in msg.lower() or "not authenticated" in msg.lower() else 500
+    return HTTPException(status_code=code, detail=msg)
+
+
+@router.get("/status")
+@limiter.limit("60/minute")
+def status(request: Request):
+    """Check whether GEE is authenticated on this server."""
+    return gee_status()
 
 
 @router.get("/detect-lakes")
@@ -30,7 +44,7 @@ def detect_lakes(request: Request):
             "lakes": lakes
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Earth Engine detection failed: {str(e)}")
+        raise _gee_http_error(e)
 
 
 @router.get("/population")
@@ -41,10 +55,15 @@ def get_population(
     lon: float = Query(...),
     radius_km: float = Query(5.0, ge=0.5, le=30)
 ):
-    result = estimate_population(lat, lon, radius_km)
-    if result.get("error") and result.get("population", 0) == 0:
-        raise HTTPException(status_code=500, detail=result["error"])
-    return result
+    try:
+        result = estimate_population(lat, lon, radius_km)
+        if result.get("error") and result.get("population", 0) == 0:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _gee_http_error(e)
 
 
 @router.get("/exposure")
@@ -55,9 +74,12 @@ def get_exposure(
     lon: float = Query(...),
     risk_level: str = Query("High")
 ):
-    if risk_level not in ["High", "Medium", "Low"]:
-        risk_level = "High"
-    return estimate_lake_exposure(lat, lon, risk_level)
+    try:
+        if risk_level not in ["High", "Medium", "Low"]:
+            risk_level = "High"
+        return estimate_lake_exposure(lat, lon, risk_level)
+    except Exception as e:
+        raise _gee_http_error(e)
 
 
 @router.get("/historical")
@@ -75,7 +97,7 @@ def historical_area(
     try:
         return get_historical_areas(lat, lon)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _gee_http_error(e)
 
 
 @router.get("/thumbnail")
@@ -92,7 +114,12 @@ def lake_thumbnail(
     mode=ndwi → water-highlighted
     Example: /gee/thumbnail?lat=36.318&lon=74.865&mode=ndwi
     """
-    result = get_lake_thumbnail(lat, lon, mode=mode)
-    if result.get("error"):
-        raise HTTPException(status_code=500, detail=result["error"])
-    return result
+    try:
+        result = get_lake_thumbnail(lat, lon, mode=mode)
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _gee_http_error(e)

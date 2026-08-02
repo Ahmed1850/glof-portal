@@ -1,42 +1,101 @@
 # app/utils/gee_detection.py
 
+import json
 import os
+import tempfile
 from functools import wraps
 
 ee = None
 GEE_READY = False
 GEE_ERROR = None
+GEE_MODE = None  # "service_account" | "default" | None
+
+
+def _credentials_from_env():
+    """
+    Resolve Earth Engine credentials for local + Render.
+
+    Supported env vars (first match wins):
+      1. EE_CREDENTIALS_JSON  — full service-account JSON string (best for Render secrets)
+      2. EE_SERVICE_ACCOUNT_JSON / GOOGLE_APPLICATION_CREDENTIALS — path to JSON file
+         OR a raw JSON string starting with '{'
+    """
+    from google.oauth2 import service_account
+
+    scopes = [
+        "https://www.googleapis.com/auth/earthengine",
+        "https://www.googleapis.com/auth/cloud-platform",
+    ]
+
+    raw = os.getenv("EE_CREDENTIALS_JSON", "").strip()
+    if raw:
+        info = json.loads(raw)
+        return service_account.Credentials.from_service_account_info(info, scopes=scopes), "service_account"
+
+    for key in ("GOOGLE_APPLICATION_CREDENTIALS", "EE_SERVICE_ACCOUNT_JSON"):
+        val = (os.getenv(key) or "").strip()
+        if not val:
+            continue
+        if val.startswith("{"):
+            info = json.loads(val)
+            # Persist so other Google libs can find it if needed
+            path = os.path.join(tempfile.gettempdir(), "ee-service-account.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(val)
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+            return service_account.Credentials.from_service_account_info(info, scopes=scopes), "service_account"
+        if os.path.isfile(val):
+            return service_account.Credentials.from_service_account_file(val, scopes=scopes), "service_account"
+
+    return None, None
 
 
 def _init_ee():
     """Initialize Earth Engine if credentials exist; never crash the whole API."""
-    global ee, GEE_READY, GEE_ERROR
+    global ee, GEE_READY, GEE_ERROR, GEE_MODE
     if GEE_READY:
         return True
     try:
         import ee as _ee
         ee = _ee
         project = os.getenv("EE_PROJECT", "glof-portal-502521")
-        # Prefer service account JSON on hosting, else default ADC / local auth
-        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("EE_SERVICE_ACCOUNT_JSON")
-        if creds_path and os.path.isfile(creds_path):
-            from google.oauth2 import service_account
-            credentials = service_account.Credentials.from_service_account_file(
-                creds_path,
-                scopes=["https://www.googleapis.com/auth/earthengine"],
-            )
+
+        credentials, mode = _credentials_from_env()
+        if credentials is not None:
             ee.Initialize(credentials=credentials, project=project)
+            GEE_MODE = mode
         else:
-            # Local machine may already be authenticated; hosting often is not
+            # Local: earthengine authenticate / application-default credentials
             ee.Initialize(project=project)
+            GEE_MODE = "default"
+
         GEE_READY = True
         GEE_ERROR = None
+        print(f"GEE initialized (mode={GEE_MODE}, project={project})")
         return True
     except Exception as e:
         GEE_READY = False
+        GEE_MODE = None
         GEE_ERROR = str(e)
         print(f"GEE not initialized (API will still run): {e}")
         return False
+
+
+def gee_status() -> dict:
+    """Public diagnostic payload for /gee/status."""
+    if not GEE_READY:
+        _init_ee()
+    return {
+        "ready": GEE_READY,
+        "mode": GEE_MODE,
+        "project": os.getenv("EE_PROJECT", "glof-portal-502521"),
+        "error": None if GEE_READY else GEE_ERROR,
+        "hint": None if GEE_READY else (
+            "Add a Google service account on Render: set secret EE_CREDENTIALS_JSON "
+            "to the full service-account JSON, EE_PROJECT to your GCP project id, "
+            "and register the service account email at https://signup.earthengine.google.com/#!/service_accounts"
+        ),
+    }
 
 
 # Attempt once at import — failures are non-fatal
@@ -49,7 +108,8 @@ def _require_ee(fn):
         if not GEE_READY and not _init_ee():
             raise RuntimeError(
                 f"Google Earth Engine unavailable: {GEE_ERROR or 'not authenticated'}. "
-                "Set EE credentials on the server for satellite features."
+                "On Render, set secret env EE_CREDENTIALS_JSON (service account JSON) "
+                "and EE_PROJECT, then register the SA email with Earth Engine."
             )
         return fn(*args, **kwargs)
     return wrapper

@@ -15,6 +15,29 @@ Glacial Lake Outburst Flood (GLOF) monitoring portal for Gilgit-Baltistan — Fa
 
 > Free Render hosting may sleep after ~15 minutes of idle time. The first request after sleep can take 30–60 seconds.
 
+### GEE status (satellite features)
+
+| Resource | URL |
+|----------|-----|
+| **GEE status** | https://glof-portal.onrender.com/gee/status |
+
+Satellite Detection, Population Exposure, Historical area, and live thumbnails need **Google Earth Engine service-account credentials** on Render. Without them the rest of the portal works, but GEE routes return `503`.
+
+#### Enable GEE on Render (one-time)
+
+1. Create a Google Cloud project (or use `glof-portal-502521` if you own it).
+2. Enable the **Earth Engine API** for that project.
+3. Create a **service account** → download its JSON key.
+4. Register the service-account email with Earth Engine:  
+   https://signup.earthengine.google.com/#!/service_accounts
+5. In Render → your service → **Environment** → add secrets:
+   - `EE_PROJECT` = your GCP project id  
+   - `EE_CREDENTIALS_JSON` = **entire contents** of the service-account JSON file (one line / paste as secret)
+6. **Manual Deploy** → clear build cache optional → deploy.
+7. Check: https://glof-portal.onrender.com/gee/status → `"ready": true`
+
+Never commit the service-account JSON to GitHub.
+
 ## Project structure
 
 ```
