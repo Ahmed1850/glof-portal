@@ -1,0 +1,156 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
+
+:root {
+  --void: #060b13;
+  --panel: #0c1826;
+  --panel-alt: #101d2c;
+  --panel-light: #f7f9fb;
+  --panel-light-alt: #eef2f6;
+  --line: rgba(103, 232, 249, 0.14);
+  --line-light: #dbe4ec;
+  --ice: #5eead4;
+  --signal: #38bdf8;
+  --risk-high: #f0433a;
+  --risk-medium: #f5a524;
+  --risk-low: #2dd48e;
+  --text-hi: #eaf4f8;
+  --text-mid: #8ea3ba;
+  --text-lo: #4c6079;
+  --font-display: 'Space Grotesk', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-body: 'Inter', system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: var(--font-body);
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(94, 234, 212, 0.25); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(94, 234, 212, 0.45); }
+
+@keyframes hud-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+
+@keyframes hud-scan {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100%); }
+}
+
+@keyframes contour-drift {
+  0% { transform: translate(0, 0); }
+  100% { transform: translate(-40px, -24px); }
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Smooth scroll + respect reduced motion for CSS keyframes */
+html { scroll-behavior: smooth; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  html { scroll-behavior: auto; }
+}
+
+@keyframes spin-ring {
+  to { transform: rotate(360deg); }
+}
+
+.btn-3d {
+  transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
+}
+.btn-3d:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.08);
+}
+.btn-3d:active {
+  transform: translateY(0);
+  filter: brightness(0.96);
+}
+
+.input-3d {
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.input-3d:focus {
+  outline: none;
+  border-color: var(--signal) !important;
+  box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.15);
+}
+
+/* HUD corner brackets - the signature panel treatment */
+.hud-frame {
+  position: relative;
+}
+.hud-frame::before,
+.hud-frame::after,
+.hud-frame .hud-corner-tr,
+.hud-frame .hud-corner-bl {
+  content: '';
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+}
+.hud-frame::before {
+  top: -1px; left: -1px;
+  border-top: 2px solid var(--ice);
+  border-left: 2px solid var(--ice);
+  border-radius: 3px 0 0 0;
+}
+.hud-frame::after {
+  bottom: -1px; right: -1px;
+  border-bottom: 2px solid var(--ice);
+  border-right: 2px solid var(--ice);
+  border-radius: 0 0 3px 0;
+}
+
+.mono-label {
+  font-family: var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* Leaflet 3D marker */
+.marker-3d-container {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.marker-ring {
+  position: absolute;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  opacity: 0.35;
+  animation: hud-pulse 2.2s ease-in-out infinite;
+}
+.marker-sphere {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  z-index: 2;
+}
+
+.leaflet-popup-content-wrapper {
+  border-radius: 14px !important;
+  font-family: var(--font-body) !important;
+}
+.leaflet-popup-tip { background: #fff !important; }

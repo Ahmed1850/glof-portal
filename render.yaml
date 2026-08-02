@@ -1,0 +1,36 @@
+# Render Blueprint — free-tier friendly
+# Deploy: https://dashboard.render.com/select-repo?type=blueprint
+services:
+  - type: web
+    name: glof-portal-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: DATABASE_URL
+        value: sqlite:////tmp/glof.db
+      - key: CORS_ORIGINS
+        # Update after frontend deploy (Vercel/Netlify URL)
+        value: https://glof-portal.vercel.app,http://localhost:5173
+      - key: SEED_ON_START
+        value: "1"
+
+  - type: web
+    name: glof-portal-web
+    runtime: static
+    plan: free
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        # Update to your Render API URL after first deploy
+        value: https://glof-portal-api.onrender.com
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
