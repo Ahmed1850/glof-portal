@@ -4,11 +4,14 @@ GLOF Early Warning / Flood Monitoring API
 
 from __future__ import annotations
 
+import json
 import math
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -52,22 +55,87 @@ def nearest_glacier_km(lat: float, lon: float) -> float:
     return min(_haversine_km(lat, lon, glat, glon) for glat, glon in GLACIER_REFS)
 
 
-def fetch_elevation_m(lat: float, lon: float) -> Optional[float]:
-    """Open-Meteo elevation API (no key) — works on free hosting."""
+def _http_get_json(url: str, timeout: float = 20.0) -> dict:
+    """Stdlib GET — more reliable on free hosts than httpx in some environments."""
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "GLOF-Portal/1.0 (early-warning; educational)"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_elevation_open_meteo(lat: float, lon: float) -> Optional[float]:
+    """Open-Meteo elevation API (no key)."""
     try:
-        url = "https://api.open-meteo.com/v1/elevation"
-        with httpx.Client(timeout=15.0) as client:
-            r = client.get(url, params={"latitude": lat, "longitude": lon})
-            r.raise_for_status()
-            data = r.json()
-            elev = data.get("elevation")
-            if isinstance(elev, list) and elev:
-                return float(elev[0])
-            if elev is not None:
-                return float(elev)
-    except Exception:
-        pass
+        qs = urllib.parse.urlencode({"latitude": lat, "longitude": lon})
+        data = _http_get_json(f"https://api.open-meteo.com/v1/elevation?{qs}")
+        elev = data.get("elevation")
+        if isinstance(elev, list) and elev:
+            return float(elev[0])
+        if elev is not None:
+            return float(elev)
+    except Exception as e:
+        print(f"Open-Meteo elevation failed for {lat},{lon}: {e}")
     return None
+
+
+def fetch_elevation_open_elevation(lat: float, lon: float) -> Optional[float]:
+    """Public Open-Elevation fallback."""
+    try:
+        qs = urllib.parse.urlencode({"locations": f"{lat},{lon}"})
+        data = _http_get_json(f"https://api.open-elevation.com/api/v1/lookup?{qs}")
+        results = data.get("results") or []
+        if results and results[0].get("elevation") is not None:
+            return float(results[0]["elevation"])
+    except Exception as e:
+        print(f"Open-Elevation failed for {lat},{lon}: {e}")
+    return None
+
+
+def fetch_elevation_gee_srtm(lat: float, lon: float) -> Optional[float]:
+    """SRTM elevation via Google Earth Engine (works when EE credentials are set)."""
+    if not GEE_READY and not _init_ee():
+        return None
+    try:
+        from app.utils.gee_detection import ee
+        if ee is None:
+            return None
+        point = ee.Geometry.Point([lon, lat])
+        elev_img = ee.Image("USGS/SRTMGL1_003").select("elevation")
+        sample = elev_img.reduceRegion(
+            reducer=ee.Reducer.first(),
+            geometry=point,
+            scale=30,
+            maxPixels=1e6,
+        ).getInfo()
+        if sample and sample.get("elevation") is not None:
+            return float(sample["elevation"])
+    except Exception as e:
+        print(f"GEE SRTM elevation failed for {lat},{lon}: {e}")
+    return None
+
+
+def fetch_elevation_m(lat: float, lon: float) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Multi-source elevation (metres).
+    Order: Open-Meteo → Open-Elevation → GEE SRTM.
+    Returns (elevation_m, source_label).
+    """
+    elev = fetch_elevation_open_meteo(lat, lon)
+    if elev is not None:
+        return elev, "Open-Meteo"
+
+    elev = fetch_elevation_open_elevation(lat, lon)
+    if elev is not None:
+        return elev, "Open-Elevation"
+
+    elev = fetch_elevation_gee_srtm(lat, lon)
+    if elev is not None:
+        return elev, "GEE SRTM"
+
+    return None, None
 
 
 def fetch_growth_from_gee(lat: float, lon: float) -> Optional[float]:
@@ -136,7 +204,7 @@ def assess_lake(
             "data_sources": {"note": "Missing coordinates — area-only score"},
         }
 
-    elevation_m = fetch_elevation_m(lat, lon)
+    elevation_m, elevation_source = fetch_elevation_m(lat, lon)
     glacier_km = round(nearest_glacier_km(lat, lon), 2)
 
     growth = None
@@ -164,7 +232,7 @@ def assess_lake(
         "area_ha": area_ha,
         "early_warning": result,
         "data_sources": {
-            "elevation": "Open-Meteo" if elevation_m is not None else None,
+            "elevation": elevation_source,
             "growth": "GEE Sentinel-2 NDWI" if growth is not None else "unavailable",
             "population": pop.get("source"),
             "glacier": "reference glacier points (GB)",
