@@ -1,8 +1,10 @@
 import os
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -38,7 +40,6 @@ _default_origins = [
     "http://127.0.0.1:5174",
 ]
 _extra = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
-# Allow all configured origins; include common free-hosting patterns if none set
 allow_origins = list(dict.fromkeys(_default_origins + _extra)) or _default_origins
 
 app.add_middleware(
@@ -53,8 +54,6 @@ app.add_middleware(
 from app.models.audit import AuditLog
 from app.db.session import SessionLocal
 
-# ...
-
 # Middleware for audit logging
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -63,7 +62,7 @@ async def log_requests(request: Request, call_next):
         db = SessionLocal()
         try:
             audit_log = AuditLog(
-                user_id="unknown", # Need to extract from token later
+                user_id="unknown",  # Need to extract from token later
                 action=f"{request.method} {request.url.path}",
                 ip_address=request.client.host
             )
@@ -71,7 +70,7 @@ async def log_requests(request: Request, call_next):
             db.commit()
         finally:
             db.close()
-            
+
     response = await call_next(request)
     return response
 
@@ -81,7 +80,6 @@ import socketio
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 sio_app = socketio.ASGIApp(sio, app)
 
-# ...
 # Create tables (now includes known_lakes)
 Base.metadata.create_all(bind=engine)
 
@@ -96,7 +94,6 @@ def _seed_if_empty():
     """Populate lakes on free hosting restarts when DB is empty."""
     if os.getenv("SEED_ON_START", "0") not in ("1", "true", "True", "yes"):
         return
-    from app.db.session import SessionLocal
     from app.api.routers.lakes import KNOWN_LAKES_SEED
     from app.utils.risk import calculate_risk
     from app.models.lake import Lake as LakeModel, KnownLake as KnownLakeModel
@@ -135,14 +132,41 @@ def _seed_if_empty():
 
 _seed_if_empty()
 
-
-@app.get("/")
-@limiter.limit("30/minute")
-def root(request: Request):
-    return {"message": "GLOF Portal Backend is running!"}
+# Optional SPA bundle (built frontend copied to backend/static for single-service host)
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
 @app.get("/health")
 @limiter.limit("60/minute")
 def health(request: Request):
     return {"status": "ok"}
+
+
+@app.get("/api")
+@limiter.limit("30/minute")
+def api_root(request: Request):
+    return {"message": "GLOF Portal Backend is running!"}
+
+
+@app.get("/")
+def root():
+    index = STATIC_DIR / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    return {"message": "GLOF Portal Backend is running!", "docs": "/docs"}
+
+
+if STATIC_DIR.is_dir():
+    assets = STATIC_DIR / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets)), name="assets")
+
+    @app.get("/{full_path:path}")
+    def spa_fallback(full_path: str):
+        """Serve built React app for client-side routes (API routes take priority)."""
+        if full_path.startswith(("lakes", "gee", "risk", "auth", "docs", "openapi", "redoc", "health", "api")):
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+        candidate = STATIC_DIR / full_path
+        if candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(STATIC_DIR / "index.html")
