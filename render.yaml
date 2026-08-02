@@ -1,16 +1,29 @@
-# Single free web service: builds React + runs FastAPI (serves UI + API)
-# Deploy: https://dashboard.render.com/select-repo?type=blueprint
+# Free single service: API + UI
+# Python runtime does not include Node — install via nvm during build.
 services:
   - type: web
     name: glof-portal
     runtime: python
     plan: free
     buildCommand: |
+      set -e
       pip install -r backend/requirements.txt
-      cd frontend && npm install && VITE_API_URL= npm run build
+      # Install Node for frontend build
+      curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+      export NVM_DIR="$HOME/.nvm"
+      . "$NVM_DIR/nvm.sh"
+      nvm install 20
+      nvm use 20
+      cd frontend
+      npm ci || npm install
+      # Same-origin API (empty VITE_API_URL)
+      VITE_API_URL= npm run build
       mkdir -p ../backend/static
       cp -r dist/* ../backend/static/
+      cd ..
+      ls -la backend/static | head
     startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.8"

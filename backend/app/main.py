@@ -41,12 +41,17 @@ _default_origins = [
 ]
 _extra = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 allow_origins = list(dict.fromkeys(_default_origins + _extra)) or _default_origins
+# Star cannot be used with credentials
+_allow_credentials = True
+if "*" in allow_origins:
+    allow_origins = ["*"]
+    _allow_credentials = False
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
-    allow_origin_regex=r"https://.*\.(vercel\.app|netlify\.app|onrender\.com|pages\.dev)",
-    allow_credentials=True,
+    allow_origin_regex=None if allow_origins == ["*"] else r"https://.*\.(vercel\.app|netlify\.app|onrender\.com|pages\.dev)",
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

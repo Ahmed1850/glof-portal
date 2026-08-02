@@ -1,10 +1,61 @@
 # app/utils/gee_detection.py
 
-import ee
+import os
+from functools import wraps
 
-ee.Initialize(project='glof-portal-502521')
+ee = None
+GEE_READY = False
+GEE_ERROR = None
 
 
+def _init_ee():
+    """Initialize Earth Engine if credentials exist; never crash the whole API."""
+    global ee, GEE_READY, GEE_ERROR
+    if GEE_READY:
+        return True
+    try:
+        import ee as _ee
+        ee = _ee
+        project = os.getenv("EE_PROJECT", "glof-portal-502521")
+        # Prefer service account JSON on hosting, else default ADC / local auth
+        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("EE_SERVICE_ACCOUNT_JSON")
+        if creds_path and os.path.isfile(creds_path):
+            from google.oauth2 import service_account
+            credentials = service_account.Credentials.from_service_account_file(
+                creds_path,
+                scopes=["https://www.googleapis.com/auth/earthengine"],
+            )
+            ee.Initialize(credentials=credentials, project=project)
+        else:
+            # Local machine may already be authenticated; hosting often is not
+            ee.Initialize(project=project)
+        GEE_READY = True
+        GEE_ERROR = None
+        return True
+    except Exception as e:
+        GEE_READY = False
+        GEE_ERROR = str(e)
+        print(f"GEE not initialized (API will still run): {e}")
+        return False
+
+
+# Attempt once at import — failures are non-fatal
+_init_ee()
+
+
+def _require_ee(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not GEE_READY and not _init_ee():
+            raise RuntimeError(
+                f"Google Earth Engine unavailable: {GEE_ERROR or 'not authenticated'}. "
+                "Set EE credentials on the server for satellite features."
+            )
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+@_require_ee
 def detect_glacial_lakes():
     """
     Improved detection of glacial lakes in high-elevation areas of Gilgit-Baltistan
@@ -73,6 +124,7 @@ def detect_glacial_lakes():
     return results
 
 
+@_require_ee
 def detect_glacial_lakes_sar():
     """
     Detect glacial lakes using Sentinel-1 SAR data (can see through clouds).
@@ -104,6 +156,7 @@ def detect_glacial_lakes_sar():
     return {"message": "SAR detection functionality added", "features": lakes_info.get('features', [])}
 
 
+@_require_ee
 def estimate_population(lat: float, lon: float, radius_km: float = 5.0) -> dict:
     if lat is None or lon is None:
         return {"population": 0, "radius_km": radius_km, "error": "Missing coordinates"}
@@ -142,6 +195,7 @@ def estimate_population(lat: float, lon: float, radius_km: float = 5.0) -> dict:
         return {"population": 0, "radius_km": radius_km, "error": str(e)}
 
 
+@_require_ee
 def estimate_lake_exposure(lat: float, lon: float, risk_level: str = "High") -> dict:
     if risk_level == "High":
         danger_km, warning_km = 5.0, 10.0
@@ -164,6 +218,7 @@ def estimate_lake_exposure(lat: float, lon: float, risk_level: str = "High") -> 
 
 
 # ==================== HISTORICAL AREA (Sentinel-2 NDWI) ====================
+@_require_ee
 def estimate_area_for_year(lat: float, lon: float, year: int, buffer_m: float = 1500) -> dict:
     """
     Estimate water area (ha) around a lake point for one summer season.
@@ -216,6 +271,7 @@ def estimate_area_for_year(lat: float, lon: float, year: int, buffer_m: float = 
             "error": str(e)
         }
 
+@_require_ee
 def get_historical_areas(lat: float, lon: float, years=None) -> dict:
     """
     Get estimated area for consecutive years (2015–2025 = 11 years)
@@ -249,6 +305,7 @@ def get_historical_areas(lat: float, lon: float, years=None) -> dict:
 
 
 # ==================== LIVE SATELLITE THUMBNAILS ====================
+@_require_ee
 def get_lake_thumbnail(lat: float, lon: float, buffer_m: float = 2000, mode: str = "ndwi") -> dict:
     """
     Generate a live thumbnail URL around the lake.
