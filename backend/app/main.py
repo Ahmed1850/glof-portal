@@ -13,6 +13,7 @@ from app.api.routers.lakes import router as lakes_router
 from app.api.routers.risk import router as risk_router
 from app.api.routers.gee import router as gee_router
 from app.api.routers.auth import router as auth_router
+from app.api.routers.early_warning import router as early_warning_router
 from app.db.base import Base
 from app.db.session import engine
 
@@ -93,6 +94,7 @@ app.include_router(lakes_router)
 app.include_router(risk_router)
 app.include_router(gee_router)
 app.include_router(auth_router)
+app.include_router(early_warning_router)
 
 
 def _seed_if_empty():
@@ -169,7 +171,7 @@ if STATIC_DIR.is_dir():
     @app.get("/{full_path:path}")
     def spa_fallback(full_path: str):
         """Serve built React app for client-side routes (API routes take priority)."""
-        if full_path.startswith(("lakes", "gee", "risk", "auth", "docs", "openapi", "redoc", "health", "api")):
+        if full_path.startswith(("lakes", "gee", "risk", "auth", "early-warning", "docs", "openapi", "redoc", "health", "api")):
             return JSONResponse({"detail": "Not found"}, status_code=404)
         candidate = STATIC_DIR / full_path
         if candidate.is_file():

@@ -109,6 +109,13 @@ function AppContent() {
   const [exposureData, setExposureData] = useState({});
   const [exposureLoading, setExposureLoading] = useState(false);
 
+  // Flood Monitoring / Early Warning
+  const [ewData, setEwData] = useState(null);
+  const [ewLoading, setEwLoading] = useState(false);
+  const [ewUseGee, setEwUseGee] = useState(false);
+  const [ewFilter, setEwFilter] = useState('All');
+  const [ewSelected, setEwSelected] = useState(null);
+
   // Historical
   const [histLakeId, setHistLakeId] = useState('');
   const [histData, setHistData] = useState(null);
@@ -543,6 +550,24 @@ function AppContent() {
     }
   };
 
+  const fetchEarlyWarningBoard = async (useGee = ewUseGee) => {
+    setEwLoading(true);
+    setEwSelected(null);
+    try {
+      const res = await axios.get(`${API_BASE}/early-warning/monitor`, {
+        params: { use_gee: useGee, limit: 50 },
+        timeout: useGee ? 300000 : 120000,
+      });
+      setEwData(res.data);
+    } catch (err) {
+      const detail = err?.response?.data?.detail || err.message || 'Failed to load early warning scores';
+      alert(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      setEwData(null);
+    } finally {
+      setEwLoading(false);
+    }
+  };
+
   const getRiskExplanation = (lake) => {
     const area = Number(lake.area_ha) || 0;
     const risk = calculateRisk(area);
@@ -708,6 +733,7 @@ function AppContent() {
           {navItem('dashboard', 'Dashboard', IconDashboard)}
           {navItem('analytics', 'Analytics', IconShield)}
           {navItem('population', 'Population', IconInfo)}
+          {navItem('flood', 'Flood Monitoring', IconPulseDot)}
           {navItem('historical', 'Historical', IconSatellite)}
           {navItem('lakes', 'Lakes Inventory', IconLakes)}
           {navItem('add', 'Register New Lake', IconPlus)}
@@ -759,6 +785,7 @@ function AppContent() {
                 {activeTab === 'dashboard' && 'Dashboard'}
                 {activeTab === 'analytics' && 'Analytics'}
                 {activeTab === 'population' && 'Population Exposure'}
+                {activeTab === 'flood' && 'Flood Monitoring'}
                 {activeTab === 'historical' && 'Historical Analysis'}
                 {activeTab === 'lakes' && 'Lakes Inventory'}
                 {activeTab === 'add' && 'Register New Lake'}
@@ -1528,6 +1555,301 @@ function AppContent() {
               )}
             </div>
           )}
+
+          {/* FLOOD MONITORING / EARLY WARNING */}
+          {activeTab === 'flood' && (() => {
+            const LEVEL_COLOR = {
+              Critical: '#f0433a',
+              Warning: '#f5a524',
+              Watch: '#38bdf8',
+              Normal: '#2dd48e',
+            };
+            const counts = ewData?.counts || { Critical: 0, Warning: 0, Watch: 0, Normal: 0 };
+            const board = (ewData?.lakes || []).filter(
+              (row) => ewFilter === 'All' || row?.early_warning?.level === ewFilter
+            );
+            const selected = ewSelected || board[0] || null;
+            const ew = selected?.early_warning;
+
+            return (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+                <div style={{ ...cardStyle, padding: 24 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' }}>
+                    <div>
+                      <div style={eyebrow}>GLOF Early Warning Score</div>
+                      <h3 style={{ ...sectionTitle, marginBottom: 8 }}>Flood Monitoring Board</h3>
+                      <p style={{ margin: 0, color: pal.mid, fontSize: 13.5, maxWidth: 720, lineHeight: 1.55 }}>
+                        Composite score from <strong>lake area</strong>, <strong>3–5 year growth</strong>,{' '}
+                        <strong>elevation</strong>, <strong>glacier proximity</strong>, and{' '}
+                        <strong>downstream population</strong>. Lakes are classed as{' '}
+                        <span style={{ color: '#2dd48e', fontWeight: 700 }}>Normal</span>,{' '}
+                        <span style={{ color: '#38bdf8', fontWeight: 700 }}>Watch</span>,{' '}
+                        <span style={{ color: '#f5a524', fontWeight: 700 }}>Warning</span>, or{' '}
+                        <span style={{ color: '#f0433a', fontWeight: 700 }}>Critical</span>.
+                      </p>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, alignItems: 'flex-end' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: pal.mid, cursor: 'pointer' }}>
+                        <input
+                          type="checkbox"
+                          checked={ewUseGee}
+                          onChange={(e) => setEwUseGee(e.target.checked)}
+                        />
+                        Include GEE growth + population (slower)
+                      </label>
+                      <motion.button
+                        className="btn-3d"
+                        whileHover={{ scale: 1.03 }}
+                        whileTap={{ scale: 0.97 }}
+                        disabled={ewLoading}
+                        onClick={() => fetchEarlyWarningBoard(ewUseGee)}
+                        style={{
+                          padding: '11px 18px', borderRadius: 12, border: 'none',
+                          background: ewLoading ? '#94a3b8' : 'linear-gradient(135deg,#5eead4,#38bdf8)',
+                          color: '#06131a', fontWeight: 800, fontSize: 13, cursor: 'pointer'
+                        }}
+                      >
+                        {ewLoading ? 'Scoring lakes…' : 'Run Early Warning Scan'}
+                      </motion.button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Level KPI cards */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 12 }}>
+                  {['Critical', 'Warning', 'Watch', 'Normal'].map((lvl) => (
+                    <motion.div
+                      key={lvl}
+                      whileHover={{ y: -3 }}
+                      onClick={() => setEwFilter(ewFilter === lvl ? 'All' : lvl)}
+                      style={{
+                        ...cardStyle,
+                        padding: '16px 18px',
+                        cursor: 'pointer',
+                        border: ewFilter === lvl ? `1.5px solid ${LEVEL_COLOR[lvl]}` : cardStyle.border,
+                      }}
+                    >
+                      <div className="mono-label" style={{ fontSize: 10.5, color: pal.mid, marginBottom: 6 }}>{lvl}</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 28, fontWeight: 700, color: LEVEL_COLOR[lvl] }}>
+                        {counts[lvl] ?? 0}
+                      </div>
+                    </motion.div>
+                  ))}
+                </div>
+
+                {!ewData && !ewLoading && (
+                  <div style={{ ...cardStyle, padding: 48, textAlign: 'center', color: pal.mid }}>
+                    Click <strong style={{ color: pal.accent }}>Run Early Warning Scan</strong> to score all registered lakes.
+                    <div style={{ marginTop: 10, fontSize: 12.5 }}>
+                      Fast mode uses area + elevation + glacier proximity. Enable GEE for growth rate and population.
+                    </div>
+                  </div>
+                )}
+
+                {ewLoading && (
+                  <div style={{ ...cardStyle, padding: 48, textAlign: 'center', color: pal.mid }}>
+                    Computing Early Warning Scores{ewUseGee ? ' with GEE (may take several minutes)…' : '…'}
+                  </div>
+                )}
+
+                {ewData && !ewLoading && (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.15fr) minmax(280px, 0.85fr)', gap: 20 }}>
+                    {/* Table */}
+                    <div style={{ ...cardStyle, padding: 20, overflow: 'hidden' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
+                        <div>
+                          <div style={eyebrow}>Priority Queue</div>
+                          <h3 style={{ ...sectionTitle, fontSize: 16 }}>
+                            {ewFilter === 'All' ? `All lakes (${board.length})` : `${ewFilter} (${board.length})`}
+                          </h3>
+                        </div>
+                        <button
+                          onClick={() => setEwFilter('All')}
+                          style={{
+                            padding: '6px 12px', borderRadius: 8, border: `1px solid ${pal.border}`,
+                            background: pal.panelAlt, color: pal.mid, cursor: 'pointer', fontSize: 12, fontWeight: 600
+                          }}
+                        >
+                          Clear filter
+                        </button>
+                      </div>
+                      <div style={{ overflowX: 'auto', maxHeight: 520, overflowY: 'auto' }}>
+                        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                          <thead>
+                            <tr style={{ background: pal.panelAlt }}>
+                              {['#', 'Lake', 'Score', 'Level', 'Area', 'Elev.', 'Glacier'].map((h) => (
+                                <th key={h} className="mono-label" style={{ padding: '10px 12px', fontSize: 10.5, color: pal.mid, textAlign: 'left' }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {board.length === 0 ? (
+                              <tr>
+                                <td colSpan={7} style={{ padding: 28, textAlign: 'center', color: pal.mid }}>No lakes in this class</td>
+                              </tr>
+                            ) : board.map((row, i) => {
+                              const level = row.early_warning?.level || 'Normal';
+                              const color = LEVEL_COLOR[level] || pal.mid;
+                              const active = selected?.lake_id === row.lake_id;
+                              return (
+                                <tr
+                                  key={row.lake_id || i}
+                                  onClick={() => setEwSelected(row)}
+                                  style={{
+                                    borderBottom: `1px solid ${pal.border}`,
+                                    cursor: 'pointer',
+                                    background: active ? (isDark ? 'rgba(56,189,248,0.1)' : 'rgba(2,132,199,0.06)') : 'transparent',
+                                  }}
+                                >
+                                  <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: pal.mid }}>{String(i + 1).padStart(2, '0')}</td>
+                                  <td style={{ padding: '10px 12px', fontWeight: 700, color: pal.hi }}>{row.name}</td>
+                                  <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', fontWeight: 700, color }}>
+                                    {row.early_warning?.score ?? '—'}
+                                  </td>
+                                  <td style={{ padding: '10px 12px' }}>
+                                    <span style={{
+                                      display: 'inline-flex', alignItems: 'center', gap: 6,
+                                      padding: '3px 10px', borderRadius: 20, fontSize: 11.5, fontWeight: 700,
+                                      background: `${color}18`, color
+                                    }}>
+                                      <span style={{ width: 6, height: 6, borderRadius: '50%', background: color }} />
+                                      {level}
+                                    </span>
+                                  </td>
+                                  <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: pal.mid, fontSize: 12.5 }}>
+                                    {row.area_ha != null ? `${row.area_ha} ha` : '—'}
+                                  </td>
+                                  <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: pal.mid, fontSize: 12.5 }}>
+                                    {row.early_warning?.inputs?.elevation_m != null
+                                      ? `${Math.round(row.early_warning.inputs.elevation_m)} m`
+                                      : '—'}
+                                  </td>
+                                  <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: pal.mid, fontSize: 12.5 }}>
+                                    {row.early_warning?.inputs?.glacier_distance_km != null
+                                      ? `${row.early_warning.inputs.glacier_distance_km.toFixed?.(1) ?? row.early_warning.inputs.glacier_distance_km} km`
+                                      : '—'}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    {/* Detail panel */}
+                    <div style={{ ...cardStyle, padding: 20 }}>
+                      {!selected ? (
+                        <div style={{ color: pal.mid, padding: 24, textAlign: 'center' }}>Select a lake for indicator breakdown</div>
+                      ) : (
+                        <>
+                          <div style={eyebrow}>Lake Profile</div>
+                          <h3 style={{ ...sectionTitle, marginBottom: 4 }}>{selected.name}</h3>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
+                            <span style={{
+                              fontFamily: 'var(--font-mono)', fontSize: 28, fontWeight: 800,
+                              color: LEVEL_COLOR[ew?.level] || pal.signal
+                            }}>
+                              {ew?.score ?? '—'}
+                            </span>
+                            <span style={{
+                              padding: '4px 12px', borderRadius: 20, fontWeight: 800, fontSize: 12,
+                              background: `${LEVEL_COLOR[ew?.level] || pal.mid}22`,
+                              color: LEVEL_COLOR[ew?.level] || pal.mid
+                            }}>
+                              {ew?.level || '—'}
+                            </span>
+                          </div>
+                          <p style={{ margin: '0 0 16px', fontSize: 13.5, color: pal.mid, lineHeight: 1.5 }}>
+                            {ew?.advice}
+                          </p>
+
+                          <div style={eyebrow}>Indicator Breakdown</div>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 8 }}>
+                            {(ew?.indicators || []).map((ind) => {
+                              const pct = Math.min(100, (Number(ind.points) / Number(ind.max || 1)) * 100);
+                              return (
+                                <div key={ind.id}>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, gap: 8 }}>
+                                    <span style={{ fontSize: 12.5, fontWeight: 600, color: pal.hi }}>{ind.label}</span>
+                                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: pal.signal }}>
+                                      {ind.points}/{ind.max}
+                                    </span>
+                                  </div>
+                                  <div style={{ height: 8, borderRadius: 99, background: pal.panelAlt, overflow: 'hidden', border: `1px solid ${pal.border}` }}>
+                                    <div style={{
+                                      width: `${pct}%`, height: '100%', borderRadius: 99,
+                                      background: 'linear-gradient(90deg,#5eead4,#38bdf8)'
+                                    }} />
+                                  </div>
+                                  <div style={{ fontSize: 11.5, color: pal.lo, marginTop: 4 }}>{ind.detail}</div>
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          <div style={{ marginTop: 18, paddingTop: 14, borderTop: `1px solid ${pal.border}` }}>
+                            <div style={eyebrow}>Data Sources</div>
+                            <div style={{ fontSize: 12, color: pal.mid, lineHeight: 1.6, marginTop: 6 }}>
+                              <div>Elevation: {selected.data_sources?.elevation || '—'}</div>
+                              <div>Growth: {selected.data_sources?.growth || '—'}</div>
+                              <div>Population: {selected.data_sources?.population || '—'}</div>
+                              <div>Glacier: {selected.data_sources?.glacier || '—'}</div>
+                              <div>GEE ready: {selected.data_sources?.gee_ready ? 'yes' : 'no'}</div>
+                            </div>
+                          </div>
+
+                          {selected.latitude && selected.longitude && (
+                            <motion.button
+                              className="btn-3d"
+                              whileHover={{ scale: 1.02 }}
+                              whileTap={{ scale: 0.98 }}
+                              onClick={() => {
+                                setHistLakeId(String(selected.lake_id));
+                                setActiveTab('historical');
+                                const lake = lakes.find((l) => l.id === selected.lake_id);
+                                if (lake) fetchHistorical(lake);
+                              }}
+                              style={{
+                                marginTop: 16, width: '100%', padding: '10px 14px', borderRadius: 10, border: 'none',
+                                background: 'linear-gradient(135deg,#5eead4,#38bdf8)', color: '#06131a',
+                                fontWeight: 800, fontSize: 12, cursor: 'pointer'
+                              }}
+                            >
+                              Open Historical Analysis
+                            </motion.button>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Legend */}
+                <div style={{ ...cardStyle, padding: 20 }}>
+                  <div style={eyebrow}>Score Guide</div>
+                  <h3 style={{ ...sectionTitle, marginBottom: 12, fontSize: 15 }}>Alert Classification</h3>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+                    {[
+                      { level: 'Normal', range: '0–24', color: '#2dd48e', text: 'Baseline — standard surveillance' },
+                      { level: 'Watch', range: '25–49', color: '#38bdf8', text: 'Developing signals — enhanced watch' },
+                      { level: 'Warning', range: '50–74', color: '#f5a524', text: 'Elevated risk — intensify monitoring' },
+                      { level: 'Critical', range: '75–100', color: '#f0433a', text: 'High GLOF potential — immediate action' },
+                    ].map((item) => (
+                      <div key={item.level} style={{
+                        padding: 14, borderRadius: 12, border: `1px solid ${pal.border}`,
+                        background: pal.panelAlt, borderLeft: `4px solid ${item.color}`
+                      }}>
+                        <div style={{ fontWeight: 800, color: item.color, marginBottom: 4 }}>{item.level}</div>
+                        <div className="mono-label" style={{ fontSize: 10.5, color: pal.mid, marginBottom: 6 }}>{item.range}</div>
+                        <div style={{ fontSize: 12.5, color: pal.mid }}>{item.text}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* SATELLITE DETECTION */}
           {activeTab === 'satellite' && (
