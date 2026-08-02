@@ -2,6 +2,19 @@
 
 Glacial Lake Outburst Flood (GLOF) monitoring portal for Gilgit-Baltistan — FastAPI backend + React (Vite) frontend with satellite risk intelligence, lake inventory, population exposure, and historical analysis.
 
+## Live links
+
+| Resource | URL |
+|----------|-----|
+| **Live app** | https://glof-portal.onrender.com |
+| **API health** | https://glof-portal.onrender.com/health |
+| **API root** | https://glof-portal.onrender.com/api |
+| **API docs (Swagger)** | https://glof-portal.onrender.com/docs |
+| **Lakes API** | https://glof-portal.onrender.com/lakes/ |
+| **GitHub repository** | https://github.com/Ahmed1850/glof-portal |
+
+> Free Render hosting may sleep after ~15 minutes of idle time. The first request after sleep can take 30–60 seconds.
+
 ## Project structure
 
 ```
