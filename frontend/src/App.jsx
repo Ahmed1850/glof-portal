@@ -202,15 +202,16 @@ function AppContent() {
         params: { lat, lon },
         timeout: 15000,
       });
-      const t = res.data;
-      if (t?.temperature_2m != null || t?.temperature_c != null) {
+      const t = res.data || {};
+      const temp = t.temperature_2m ?? t.temperature_c;
+      if (temp != null && !Number.isNaN(Number(temp))) {
         return {
-          temperature_2m: t.temperature_2m ?? t.temperature_c,
-          relative_humidity_2m: null,
-          precipitation: null,
-          weather_code: null,
-          wind_speed_10m: null,
-          source: t.source,
+          temperature_2m: Number(temp),
+          relative_humidity_2m: t.relative_humidity_2m != null ? Number(t.relative_humidity_2m) : null,
+          precipitation: t.precipitation != null ? Number(t.precipitation) : 0,
+          weather_code: t.weather_code ?? null,
+          wind_speed_10m: t.wind_speed_10m != null ? Number(t.wind_speed_10m) : null,
+          source: t.source || 'backend',
         };
       }
     } catch {
@@ -223,6 +224,13 @@ function AppContent() {
     } catch {
       return null;
     }
+  };
+
+  const fmtWeather = (v, unit = '') => {
+    if (v == null || Number.isNaN(Number(v))) return '—';
+    const n = Number(v);
+    const shown = Number.isInteger(n) ? String(n) : n.toFixed(1);
+    return unit ? `${shown}${unit}` : shown;
   };
 
   const fetchExposureForLakes = async (lakesList) => {
@@ -1121,7 +1129,9 @@ function AppContent() {
                     <div style={eyebrow}>Atmospheric Telemetry</div>
                     <h3 style={sectionTitle}>Gilgit-Baltistan Basin</h3>
                   </div>
-                  <span className="mono-label" style={{ fontSize: 10.5, color: pal.lo }}>Live · Open-Meteo</span>
+                  <span className="mono-label" style={{ fontSize: 10.5, color: pal.lo }}>
+                    Live · {dashboardWeather?.source || 'Weather'}
+                  </span>
                 </div>
                 {dashboardWeather ? (
                   <motion.div
@@ -1131,10 +1141,10 @@ function AppContent() {
                     style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}
                   >
                     {[
-                      { label: 'Temperature', value: `${dashboardWeather.temperature_2m}°C`, color: pal.signal },
-                      { label: 'Precipitation', value: `${dashboardWeather.precipitation} mm`, color: pal.accent },
-                      { label: 'Humidity', value: `${dashboardWeather.relative_humidity_2m}%`, color: pal.signal },
-                      { label: 'Wind Speed', value: `${dashboardWeather.wind_speed_10m} km/h`, color: pal.mid },
+                      { label: 'Temperature', value: fmtWeather(dashboardWeather.temperature_2m, '°C'), color: pal.signal },
+                      { label: 'Precipitation', value: fmtWeather(dashboardWeather.precipitation, ' mm'), color: pal.accent },
+                      { label: 'Humidity', value: fmtWeather(dashboardWeather.relative_humidity_2m, '%'), color: pal.signal },
+                      { label: 'Wind Speed', value: fmtWeather(dashboardWeather.wind_speed_10m, ' km/h'), color: pal.mid },
                     ].map((item, i) => (
                       <motion.div
                         key={i}
@@ -2854,11 +2864,11 @@ function AppContent() {
                   <div style={{ background: pal.panelAlt, borderRadius: 12, padding: '14px 16px', border: `1px solid ${pal.border}` }}>
                     <div className="mono-label" style={{ fontSize: 10, color: pal.mid, marginBottom: 6 }}>Local Weather</div>
                     <div style={{ fontFamily: 'var(--font-mono)', fontSize: 16, fontWeight: 700, color: pal.hi }}>
-                      {weatherLoading ? '…' : lakeWeather ? `${lakeWeather.temperature_2m}°C` : '—'}
+                      {weatherLoading ? '…' : lakeWeather ? fmtWeather(lakeWeather.temperature_2m, '°C') : '—'}
                     </div>
                     {lakeWeather && (
                       <div style={{ fontSize: 11, color: pal.mid, marginTop: 4 }}>
-                        Wind {lakeWeather.wind_speed_10m} km/h · RH {lakeWeather.relative_humidity_2m}%
+                        Wind {fmtWeather(lakeWeather.wind_speed_10m, ' km/h')} · RH {fmtWeather(lakeWeather.relative_humidity_2m, '%')}
                       </div>
                     )}
                   </div>

@@ -26,7 +26,12 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal, get_db
 from app.models.lake import Lake as LakeModel
 from app.services.early_warning import compute_early_warning, classify_level
-from app.services.flood_impact import build_flood_impact, predict_flood_likelihood, fetch_temperature
+from app.services.flood_impact import (
+    build_flood_impact,
+    predict_flood_likelihood,
+    fetch_temperature,
+    fetch_current_weather,
+)
 from app.services.glof_basins import BASINS, assign_basin, basin_summary_for_lakes, estimate_outburst_volume_m3
 from app.utils.gee_detection import GEE_READY, _init_ee, gee_status
 
@@ -432,18 +437,22 @@ def weather_at_point(
     lon: float = Query(..., description="Longitude"),
 ):
     """
-    Cached temperature for a point (Open-Meteo → MET Norway → wttr.in).
-    Used by the dashboard and Flood Monitoring so Render does not 429 Open-Meteo.
+    Cached current weather for a point (Open-Meteo → MET Norway → wttr.in).
+    Used by the main dashboard (temp / humidity / precip / wind) and Flood Monitoring.
     """
-    t = fetch_temperature(lat, lon)
+    w = fetch_current_weather(lat, lon)
     return {
         "latitude": lat,
         "longitude": lon,
-        "temperature_c": t.get("temperature_c"),
-        "temperature_2m": t.get("temperature_c"),  # dashboard field name
-        "forecast_max_c": t.get("forecast_max_c"),
-        "source": t.get("source"),
-        "cached": t.get("cached", False),
+        "temperature_c": w.get("temperature_c"),
+        "temperature_2m": w.get("temperature_2m", w.get("temperature_c")),
+        "forecast_max_c": w.get("forecast_max_c"),
+        "relative_humidity_2m": w.get("relative_humidity_2m"),
+        "precipitation": w.get("precipitation"),
+        "wind_speed_10m": w.get("wind_speed_10m"),
+        "weather_code": w.get("weather_code"),
+        "source": w.get("source"),
+        "cached": w.get("cached", False),
     }
 
 

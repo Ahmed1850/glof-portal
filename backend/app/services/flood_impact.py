@@ -52,6 +52,38 @@ def _http_get_json(url: str, timeout: float = 12.0, headers: Optional[dict] = No
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _as_float(v) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _weather_payload(
+    *,
+    temperature_c: Optional[float],
+    forecast_max_c: Optional[float] = None,
+    relative_humidity_2m: Optional[float] = None,
+    precipitation: Optional[float] = None,
+    wind_speed_10m: Optional[float] = None,
+    weather_code: Optional[int] = None,
+    source: str,
+) -> dict:
+    """Normalized weather for API + dashboard (Open-Meteo field names)."""
+    return {
+        "temperature_c": temperature_c,
+        "temperature_2m": temperature_c,
+        "forecast_max_c": forecast_max_c if forecast_max_c is not None else temperature_c,
+        "relative_humidity_2m": relative_humidity_2m,
+        "precipitation": precipitation,
+        "wind_speed_10m": wind_speed_10m,
+        "weather_code": weather_code,
+        "source": source,
+    }
+
+
 def _fetch_open_meteo(lat: float, lon: float) -> dict:
     """Primary provider. Supports optional OPEN_METEO_API_KEY (customer API)."""
     base = os.getenv("OPEN_METEO_BASE_URL", "").strip()
@@ -65,7 +97,7 @@ def _fetch_open_meteo(lat: float, lon: float) -> dict:
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "temperature_2m",
+        "current": "temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
         "daily": "temperature_2m_max",
         "forecast_days": 3,
         "timezone": "auto",
@@ -77,16 +109,26 @@ def _fetch_open_meteo(lat: float, lon: float) -> dict:
     for attempt in range(3):
         try:
             data = _http_get_json(f"{base}?{qs}", timeout=10.0)
-            current = (data.get("current") or {}).get("temperature_2m")
+            cur = data.get("current") or {}
+            current = _as_float(cur.get("temperature_2m"))
             daily_max = (data.get("daily") or {}).get("temperature_2m_max") or []
             peak = max([x for x in daily_max if x is not None], default=current)
             if current is None and peak is None:
                 raise ValueError("Open-Meteo returned empty temperature")
-            return {
-                "temperature_c": float(current) if current is not None else None,
-                "forecast_max_c": float(peak) if peak is not None else None,
-                "source": "Open-Meteo",
-            }
+            wc = cur.get("weather_code")
+            try:
+                weather_code = int(wc) if wc is not None else None
+            except (TypeError, ValueError):
+                weather_code = None
+            return _weather_payload(
+                temperature_c=current,
+                forecast_max_c=_as_float(peak),
+                relative_humidity_2m=_as_float(cur.get("relative_humidity_2m")),
+                precipitation=_as_float(cur.get("precipitation")),
+                wind_speed_10m=_as_float(cur.get("wind_speed_10m")),
+                weather_code=weather_code,
+                source="Open-Meteo",
+            )
         except urllib.error.HTTPError as e:
             last_err = e
             # 429 / 5xx → brief backoff then retry
@@ -119,68 +161,85 @@ def _fetch_met_no(lat: float, lon: float) -> dict:
         raise ValueError("met.no returned no timeseries")
     first = timeseries[0]
     details = ((first.get("data") or {}).get("instant") or {}).get("details") or {}
-    current = details.get("air_temperature")
-    # Peak over next ~72h of available steps
+    current = _as_float(details.get("air_temperature"))
+    humidity = _as_float(details.get("relative_humidity"))
+    # wind from m/s → km/h
+    wind_ms = _as_float(details.get("wind_speed"))
+    wind_kmh = round(wind_ms * 3.6, 1) if wind_ms is not None else None
+    # precip next 1h if present
+    next1 = ((first.get("data") or {}).get("next_1_hours") or {}).get("details") or {}
+    precip = _as_float(next1.get("precipitation_amount"))
+    if precip is None:
+        next6 = ((first.get("data") or {}).get("next_6_hours") or {}).get("details") or {}
+        precip = _as_float(next6.get("precipitation_amount"))
+
     temps = []
     for step in timeseries[:72]:
         d = ((step.get("data") or {}).get("instant") or {}).get("details") or {}
-        t = d.get("air_temperature")
+        t = _as_float(d.get("air_temperature"))
         if t is not None:
-            temps.append(float(t))
+            temps.append(t)
     peak = max(temps) if temps else current
-    return {
-        "temperature_c": float(current) if current is not None else None,
-        "forecast_max_c": float(peak) if peak is not None else None,
-        "source": "MET Norway",
-    }
+    if current is None and peak is None:
+        raise ValueError("met.no returned empty temperature")
+    return _weather_payload(
+        temperature_c=current,
+        forecast_max_c=peak,
+        relative_humidity_2m=humidity,
+        precipitation=precip if precip is not None else 0.0,
+        wind_speed_10m=wind_kmh,
+        weather_code=None,
+        source="MET Norway",
+    )
 
 
 def _fetch_wttr(lat: float, lon: float) -> dict:
     """Last-resort fallback via wttr.in JSON."""
     url = f"https://wttr.in/{lat:.3f},{lon:.3f}?format=j1"
     data = _http_get_json(url, timeout=12.0)
-    current = data.get("current_condition") or []
-    cur_c = None
-    if current:
-        try:
-            cur_c = float(current[0].get("temp_C"))
-        except (TypeError, ValueError, IndexError):
-            cur_c = None
+    current_list = data.get("current_condition") or []
+    if not current_list:
+        raise ValueError("wttr.in returned no current_condition")
+    c0 = current_list[0]
+    cur_c = _as_float(c0.get("temp_C"))
+    humidity = _as_float(c0.get("humidity"))
+    precip = _as_float(c0.get("precipMM"))
+    wind = _as_float(c0.get("windspeedKmph"))
     peak = cur_c
     weather = data.get("weather") or []
     for day in weather[:3]:
-        try:
-            mx = float(day.get("maxtempC"))
-            if peak is None or mx > peak:
-                peak = mx
-        except (TypeError, ValueError):
-            pass
+        mx = _as_float(day.get("maxtempC"))
+        if mx is not None and (peak is None or mx > peak):
+            peak = mx
     if cur_c is None and peak is None:
         raise ValueError("wttr.in returned no temperature")
-    return {
-        "temperature_c": cur_c,
-        "forecast_max_c": peak,
-        "source": "wttr.in",
-    }
+    return _weather_payload(
+        temperature_c=cur_c,
+        forecast_max_c=peak,
+        relative_humidity_2m=humidity,
+        precipitation=precip if precip is not None else 0.0,
+        wind_speed_10m=wind,
+        weather_code=None,
+        source="wttr.in",
+    )
 
 
-def fetch_temperature(lat: float, lon: float) -> dict:
+def fetch_current_weather(lat: float, lon: float) -> dict:
     """
-    Current + short-range max temperature for melt stress.
+    Full current weather for dashboard + early-warning melt stress.
 
     Strategy (Render-safe):
       1. Fresh cache hit (45 min)
-      2. Open-Meteo with retries
+      2. Open-Meteo with retries (temp, humidity, precip, wind)
       3. MET Norway
       4. wttr.in
       5. Stale cache (up to 6 h) if all providers fail
     """
     if lat is None or lon is None:
-        return {
-            "temperature_c": None,
-            "forecast_max_c": None,
-            "source": "unavailable: missing coordinates",
-        }
+        return _weather_payload(
+            temperature_c=None,
+            source="unavailable: missing coordinates",
+        )
 
     key = _temp_cache_key(lat, lon)
     now = time.time()
@@ -201,6 +260,7 @@ def fetch_temperature(lat: float, lon: float) -> dict:
                 continue
             with _TEMP_LOCK:
                 _TEMP_CACHE[key] = (time.time(), dict(result))
+            result = dict(result)
             result["cached"] = False
             return result
         except Exception as e:
@@ -214,11 +274,23 @@ def fetch_temperature(lat: float, lon: float) -> dict:
         out["fetch_errors"] = errors[-3:]
         return out
 
+    empty = _weather_payload(
+        temperature_c=None,
+        source="unavailable: " + ("; ".join(errors[-2:]) if errors else "no provider"),
+    )
+    empty["cached"] = False
+    return empty
+
+
+def fetch_temperature(lat: float, lon: float) -> dict:
+    """Current + short-range max temperature for melt stress (subset of full weather)."""
+    w = fetch_current_weather(lat, lon)
     return {
-        "temperature_c": None,
-        "forecast_max_c": None,
-        "source": "unavailable: " + ("; ".join(errors[-2:]) if errors else "no provider"),
-        "cached": False,
+        "temperature_c": w.get("temperature_c"),
+        "forecast_max_c": w.get("forecast_max_c"),
+        "source": w.get("source"),
+        "cached": w.get("cached", False),
+        "fetch_errors": w.get("fetch_errors"),
     }
 
 
