@@ -2387,25 +2387,6 @@ function AppContent() {
                                 {basinThumbLoading ? 'Loading…' : 'Reload satellite images'}
                               </button>
                             </div>
-
-                            {selected.lakes?.length > 0 && (
-                              <div style={{ height: 260, marginTop: 16, borderRadius: 12, overflow: 'hidden', border: `1px solid ${pal.border}` }}>
-                                <MapView
-                                  selectedRisk="All"
-                                  setSelectedRisk={() => {}}
-                                  lakes={selected.lakes.map((l) => ({
-                                    id: l.id,
-                                    name: l.name,
-                                    area_ha: l.area_ha,
-                                    latitude: l.latitude,
-                                    longitude: l.longitude,
-                                    risk_level: calculateRisk(l.area_ha || 0),
-                                  }))}
-                                  setSelectedLake={openLakeDetails}
-                                  loading={false}
-                                />
-                              </div>
-                            )}
                           </>
                         )}
                       </div>
