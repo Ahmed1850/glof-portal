@@ -285,6 +285,16 @@ function AppContent() {
     }
   }, [enteredPortal]);
 
+  // Auto-load basin satellite when selection changes
+  useEffect(() => {
+    if (activeTab !== 'basins' || !basinsData?.basins?.length || !selectedBasinId) return;
+    const basin = basinsData.basins.find((b) => b.id === selectedBasinId);
+    if (basin?.center) {
+      loadBasinSatellite(basin);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, selectedBasinId, basinsData]);
+
   useEffect(() => {
     if (selectedLake?.latitude && selectedLake?.longitude) {
       setWeatherLoading(true);
@@ -588,33 +598,62 @@ function AppContent() {
   };
 
   const loadBasinSatellite = async (basin) => {
-    const lat = basin?.center?.lat;
-    const lon = basin?.center?.lon;
-    if (!lat || !lon) {
+    const lat = basin?.center?.lat ?? basin?.center?.latitude;
+    const lon = basin?.center?.lon ?? basin?.center?.longitude;
+    if (lat == null || lon == null || Number.isNaN(Number(lat)) || Number.isNaN(Number(lon))) {
+      console.warn('Basin has no center coordinates', basin);
       setBasinThumbNdwi(null);
       setBasinThumbRgb(null);
+      setBasinThumbLoading(false);
       return;
     }
     setBasinThumbLoading(true);
     setBasinThumbNdwi(null);
     setBasinThumbRgb(null);
+    // Use backend-proxied PNG endpoints (browser-safe). Wider buffer for basin overview.
+    const qs = (mode) =>
+      `${API_BASE}/gee/thumbnail-image?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&mode=${mode}&buffer_m=12000&t=${Date.now()}`;
+    // Prefetch so we only flip state when images actually resolve
+    const loadImg = (src) =>
+      new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(src);
+        img.onerror = () => reject(new Error(`Failed to load ${src}`));
+        img.src = src;
+      });
     try {
-      const [ndwiRes, rgbRes] = await Promise.all([
-        axios.get(`${API_BASE}/gee/thumbnail`, {
-          params: { lat, lon, mode: 'ndwi' },
-          timeout: 120000,
-        }),
-        axios.get(`${API_BASE}/gee/thumbnail`, {
-          params: { lat, lon, mode: 'rgb' },
-          timeout: 120000,
-        }),
+      const [ndwiSrc, rgbSrc] = await Promise.all([
+        loadImg(qs('ndwi')),
+        loadImg(qs('rgb')),
       ]);
-      setBasinThumbNdwi(ndwiRes.data?.url || null);
-      setBasinThumbRgb(rgbRes.data?.url || null);
+      setBasinThumbNdwi(ndwiSrc);
+      setBasinThumbRgb(rgbSrc);
     } catch (err) {
       console.error('Basin satellite load failed', err);
-      setBasinThumbNdwi(null);
-      setBasinThumbRgb(null);
+      // Fallback: try JSON thumbnail URLs (older path)
+      try {
+        const [ndwiRes, rgbRes] = await Promise.all([
+          axios.get(`${API_BASE}/gee/thumbnail`, {
+            params: { lat, lon, mode: 'ndwi', buffer_m: 12000 },
+            timeout: 120000,
+          }),
+          axios.get(`${API_BASE}/gee/thumbnail`, {
+            params: { lat, lon, mode: 'rgb', buffer_m: 12000 },
+            timeout: 120000,
+          }),
+        ]);
+        setBasinThumbNdwi(ndwiRes.data?.url || null);
+        setBasinThumbRgb(rgbRes.data?.url || null);
+        if (!ndwiRes.data?.url && !rgbRes.data?.url) {
+          alert(ndwiRes.data?.error || rgbRes.data?.error || 'Satellite images unavailable for this basin');
+        }
+      } catch (err2) {
+        console.error('Basin satellite fallback failed', err2);
+        setBasinThumbNdwi(null);
+        setBasinThumbRgb(null);
+        const detail = err2?.response?.data?.detail || err2.message;
+        alert(`Basin satellite failed: ${typeof detail === 'string' ? detail : 'GEE thumbnail error'}`);
+      }
     } finally {
       setBasinThumbLoading(false);
     }

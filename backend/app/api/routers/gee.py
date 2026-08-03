@@ -106,7 +106,8 @@ def lake_thumbnail(
     request: Request,
     lat: float = Query(...),
     lon: float = Query(...),
-    mode: str = Query("ndwi", pattern="^(rgb|ndwi)$")
+    mode: str = Query("ndwi", pattern="^(rgb|ndwi)$"),
+    buffer_m: float = Query(2000, ge=500, le=50000),
 ):
     """
     Live satellite thumbnail around the lake.
@@ -115,10 +116,55 @@ def lake_thumbnail(
     Example: /gee/thumbnail?lat=36.318&lon=74.865&mode=ndwi
     """
     try:
-        result = get_lake_thumbnail(lat, lon, mode=mode)
+        result = get_lake_thumbnail(lat, lon, buffer_m=buffer_m, mode=mode)
         if result.get("error"):
             raise HTTPException(status_code=500, detail=result["error"])
         return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _gee_http_error(e)
+
+
+@router.get("/thumbnail-image")
+@limiter.limit("20/minute")
+def lake_thumbnail_image(
+    request: Request,
+    lat: float = Query(...),
+    lon: float = Query(...),
+    mode: str = Query("ndwi", pattern="^(rgb|ndwi)$"),
+    buffer_m: float = Query(8000, ge=500, le=50000),
+):
+    """
+    Proxy GEE thumbnail as a real PNG so browsers can display it in <img src>.
+    Earth Engine v1 thumb URLs sometimes fail as direct image sources in the browser.
+    """
+    import io
+    import urllib.request
+    from fastapi.responses import Response, StreamingResponse
+
+    try:
+        result = get_lake_thumbnail(lat, lon, buffer_m=buffer_m, mode=mode)
+        if result.get("error") or not result.get("url"):
+            raise HTTPException(
+                status_code=503,
+                detail=result.get("error") or "No thumbnail URL from Earth Engine",
+            )
+        req = urllib.request.Request(
+            result["url"],
+            headers={"User-Agent": "GLOF-Portal/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type", "image/png")
+        return Response(
+            content=data,
+            media_type=content_type,
+            headers={
+                "Cache-Control": "public, max-age=600",
+                "X-GEE-Source": "Sentinel-2",
+            },
+        )
     except HTTPException:
         raise
     except Exception as e:
