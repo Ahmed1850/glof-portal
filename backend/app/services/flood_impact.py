@@ -1,13 +1,17 @@
 """
 Flood impact footprint + GLOF flood likelihood prediction.
 
-Uses early-warning inputs, temperature (Open-Meteo), historical growth, and
-simplified downstream exposure (population + area).
+Uses early-warning inputs, temperature (Open-Meteo + fallbacks), historical growth,
+and simplified downstream exposure (population + area).
 """
 
 from __future__ import annotations
 
 import json
+import os
+import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Optional
@@ -19,43 +23,203 @@ from app.services.glof_basins import (
 )
 from app.utils.risk import calculate_risk
 
+# ---------------------------------------------------------------------------
+# Weather cache — Render free dynos share public IPs and Open-Meteo free tier
+# returns HTTP 429 under load. Cache + multi-source fallbacks keep UI working.
+# ---------------------------------------------------------------------------
+_TEMP_LOCK = threading.Lock()
+_TEMP_CACHE: dict[str, tuple[float, dict]] = {}
+_TEMP_TTL_SEC = float(os.getenv("WEATHER_CACHE_TTL_SEC", str(45 * 60)))  # 45 min
+_TEMP_STALE_SEC = float(os.getenv("WEATHER_STALE_SEC", str(6 * 3600)))  # serve stale up to 6h on errors
 
-def _http_get_json(url: str, timeout: float = 20.0) -> dict:
+
+def _temp_cache_key(lat: float, lon: float) -> str:
+    # Coarse grid so all GB lakes share ~1 request (not 46 unique Open-Meteo calls).
+    return f"{round(float(lat) * 2) / 2:.1f}:{round(float(lon) * 2) / 2:.1f}"
+
+
+def _http_get_json(url: str, timeout: float = 12.0, headers: Optional[dict] = None) -> dict:
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "GLOF-Portal/1.0 (flood-impact)"},
+        headers={
+            "User-Agent": "GLOF-Portal/1.0 (https://github.com/Ahmed1850/glof-portal; weather)",
+            "Accept": "application/json",
+            **(headers or {}),
+        },
         method="GET",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _fetch_open_meteo(lat: float, lon: float) -> dict:
+    """Primary provider. Supports optional OPEN_METEO_API_KEY (customer API)."""
+    base = os.getenv("OPEN_METEO_BASE_URL", "").strip()
+    api_key = os.getenv("OPEN_METEO_API_KEY", "").strip()
+    if not base:
+        base = (
+            "https://customer-api.open-meteo.com/v1/forecast"
+            if api_key
+            else "https://api.open-meteo.com/v1/forecast"
+        )
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m",
+        "daily": "temperature_2m_max",
+        "forecast_days": 3,
+        "timezone": "auto",
+    }
+    if api_key:
+        params["apikey"] = api_key
+    qs = urllib.parse.urlencode(params)
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            data = _http_get_json(f"{base}?{qs}", timeout=10.0)
+            current = (data.get("current") or {}).get("temperature_2m")
+            daily_max = (data.get("daily") or {}).get("temperature_2m_max") or []
+            peak = max([x for x in daily_max if x is not None], default=current)
+            if current is None and peak is None:
+                raise ValueError("Open-Meteo returned empty temperature")
+            return {
+                "temperature_c": float(current) if current is not None else None,
+                "forecast_max_c": float(peak) if peak is not None else None,
+                "source": "Open-Meteo",
+            }
+        except urllib.error.HTTPError as e:
+            last_err = e
+            # 429 / 5xx → brief backoff then retry
+            if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            raise
+    raise last_err or RuntimeError("Open-Meteo failed")
+
+
+def _fetch_met_no(lat: float, lon: float) -> dict:
+    """Fallback: Norwegian Met Institute (global coverage, free with UA)."""
+    url = (
+        "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+        f"?lat={lat:.4f}&lon={lon:.4f}"
+    )
+    data = _http_get_json(
+        url,
+        timeout=12.0,
+        headers={"User-Agent": "GLOF-Portal/1.0 github.com/Ahmed1850/glof-portal"},
+    )
+    timeseries = ((data.get("properties") or {}).get("timeseries") or [])
+    if not timeseries:
+        raise ValueError("met.no returned no timeseries")
+    first = timeseries[0]
+    details = ((first.get("data") or {}).get("instant") or {}).get("details") or {}
+    current = details.get("air_temperature")
+    # Peak over next ~72h of available steps
+    temps = []
+    for step in timeseries[:72]:
+        d = ((step.get("data") or {}).get("instant") or {}).get("details") or {}
+        t = d.get("air_temperature")
+        if t is not None:
+            temps.append(float(t))
+    peak = max(temps) if temps else current
+    return {
+        "temperature_c": float(current) if current is not None else None,
+        "forecast_max_c": float(peak) if peak is not None else None,
+        "source": "MET Norway",
+    }
+
+
+def _fetch_wttr(lat: float, lon: float) -> dict:
+    """Last-resort fallback via wttr.in JSON."""
+    url = f"https://wttr.in/{lat:.3f},{lon:.3f}?format=j1"
+    data = _http_get_json(url, timeout=12.0)
+    current = data.get("current_condition") or []
+    cur_c = None
+    if current:
+        try:
+            cur_c = float(current[0].get("temp_C"))
+        except (TypeError, ValueError, IndexError):
+            cur_c = None
+    peak = cur_c
+    weather = data.get("weather") or []
+    for day in weather[:3]:
+        try:
+            mx = float(day.get("maxtempC"))
+            if peak is None or mx > peak:
+                peak = mx
+        except (TypeError, ValueError):
+            pass
+    if cur_c is None and peak is None:
+        raise ValueError("wttr.in returned no temperature")
+    return {
+        "temperature_c": cur_c,
+        "forecast_max_c": peak,
+        "source": "wttr.in",
+    }
+
+
 def fetch_temperature(lat: float, lon: float) -> dict:
-    """Current + short-range max temperature for melt stress."""
-    try:
-        qs = urllib.parse.urlencode({
-            "latitude": lat,
-            "longitude": lon,
-            "current": "temperature_2m",
-            "daily": "temperature_2m_max",
-            "forecast_days": 3,
-            "timezone": "auto",
-        })
-        data = _http_get_json(f"https://api.open-meteo.com/v1/forecast?{qs}")
-        current = (data.get("current") or {}).get("temperature_2m")
-        daily_max = (data.get("daily") or {}).get("temperature_2m_max") or []
-        peak = max([x for x in daily_max if x is not None], default=current)
-        return {
-            "temperature_c": current,
-            "forecast_max_c": peak,
-            "source": "Open-Meteo",
-        }
-    except Exception as e:
+    """
+    Current + short-range max temperature for melt stress.
+
+    Strategy (Render-safe):
+      1. Fresh cache hit (45 min)
+      2. Open-Meteo with retries
+      3. MET Norway
+      4. wttr.in
+      5. Stale cache (up to 6 h) if all providers fail
+    """
+    if lat is None or lon is None:
         return {
             "temperature_c": None,
             "forecast_max_c": None,
-            "source": f"unavailable: {e}",
+            "source": "unavailable: missing coordinates",
         }
+
+    key = _temp_cache_key(lat, lon)
+    now = time.time()
+
+    with _TEMP_LOCK:
+        hit = _TEMP_CACHE.get(key)
+        if hit and now - hit[0] <= _TEMP_TTL_SEC:
+            out = dict(hit[1])
+            out["cached"] = True
+            return out
+        stale = hit  # may reuse if providers fail
+
+    errors: list[str] = []
+    for provider in (_fetch_open_meteo, _fetch_met_no, _fetch_wttr):
+        try:
+            result = provider(float(lat), float(lon))
+            if result.get("temperature_c") is None and result.get("forecast_max_c") is None:
+                continue
+            with _TEMP_LOCK:
+                _TEMP_CACHE[key] = (time.time(), dict(result))
+            result["cached"] = False
+            return result
+        except Exception as e:
+            errors.append(f"{provider.__name__}: {e}")
+
+    # Serve slightly stale cache rather than blank UI on 429 storms
+    if stale and now - stale[0] <= _TEMP_STALE_SEC:
+        out = dict(stale[1])
+        out["cached"] = True
+        out["source"] = f"{out.get('source', 'cache')} (stale cache; live fetch failed)"
+        out["fetch_errors"] = errors[-3:]
+        return out
+
+    return {
+        "temperature_c": None,
+        "forecast_max_c": None,
+        "source": "unavailable: " + ("; ".join(errors[-2:]) if errors else "no provider"),
+        "cached": False,
+    }
 
 
 def zone_radii_km(area_ha: Optional[float]) -> tuple[float, float]:

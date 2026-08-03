@@ -196,9 +196,29 @@ function AppContent() {
   };
 
   const fetchWeather = async (lat, lon) => {
+    // Prefer backend (cached + multi-provider) so Render does not burn Open-Meteo quota.
+    try {
+      const res = await axios.get(`${API_BASE}/early-warning/weather`, {
+        params: { lat, lon },
+        timeout: 15000,
+      });
+      const t = res.data;
+      if (t?.temperature_2m != null || t?.temperature_c != null) {
+        return {
+          temperature_2m: t.temperature_2m ?? t.temperature_c,
+          relative_humidity_2m: null,
+          precipitation: null,
+          weather_code: null,
+          wind_speed_10m: null,
+          source: t.source,
+        };
+      }
+    } catch {
+      /* fall through to direct Open-Meteo from the browser */
+    }
     try {
       const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m&timezone=auto`;
-      const res = await axios.get(url);
+      const res = await axios.get(url, { timeout: 12000 });
       return res.data.current;
     } catch {
       return null;

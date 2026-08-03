@@ -424,6 +424,29 @@ def early_warning_status(request: Request):
     }
 
 
+@router.get("/weather")
+@limiter.limit("60/minute")
+def weather_at_point(
+    request: Request,
+    lat: float = Query(..., description="Latitude"),
+    lon: float = Query(..., description="Longitude"),
+):
+    """
+    Cached temperature for a point (Open-Meteo → MET Norway → wttr.in).
+    Used by the dashboard and Flood Monitoring so Render does not 429 Open-Meteo.
+    """
+    t = fetch_temperature(lat, lon)
+    return {
+        "latitude": lat,
+        "longitude": lon,
+        "temperature_c": t.get("temperature_c"),
+        "temperature_2m": t.get("temperature_c"),  # dashboard field name
+        "forecast_max_c": t.get("forecast_max_c"),
+        "source": t.get("source"),
+        "cached": t.get("cached", False),
+    }
+
+
 @router.get("/score/{lake_id}")
 @limiter.limit("20/minute")
 def score_one_lake(
