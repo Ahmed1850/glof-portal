@@ -171,7 +171,7 @@ if STATIC_DIR.is_dir():
     @app.get("/{full_path:path}")
     def spa_fallback(full_path: str):
         """Serve built React app for client-side routes (API routes take priority)."""
-        if full_path.startswith(("lakes", "gee", "risk", "auth", "early-warning", "docs", "openapi", "redoc", "health", "api")):
+        if full_path.startswith(("lakes", "gee", "risk", "auth", "early-warning", "docs", "openapi", "redoc", "health", "api", "assets")):
             return JSONResponse({"detail": "Not found"}, status_code=404)
         candidate = STATIC_DIR / full_path
         if candidate.is_file():

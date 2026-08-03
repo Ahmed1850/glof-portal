@@ -12,7 +12,7 @@ import {
 import {
   IconDashboard, IconLakes, IconPlus, IconMountain,
   IconSearch, IconDownload, IconFilePdf, IconShield,
-  IconTrash, IconInfo, IconPulseDot, IconSatellite
+  IconTrash, IconInfo, IconPulseDot, IconSatellite, IconGlobe
 } from './components/Icons';
 import {
   pageTransition,
@@ -115,6 +115,11 @@ function AppContent() {
   const [ewUseGee, setEwUseGee] = useState(false);
   const [ewFilter, setEwFilter] = useState('All');
   const [ewSelected, setEwSelected] = useState(null);
+
+  // GLOF Basins
+  const [basinsData, setBasinsData] = useState(null);
+  const [basinsLoading, setBasinsLoading] = useState(false);
+  const [selectedBasinId, setSelectedBasinId] = useState(null);
 
   // Historical
   const [histLakeId, setHistLakeId] = useState('');
@@ -556,7 +561,7 @@ function AppContent() {
     try {
       const res = await axios.get(`${API_BASE}/early-warning/monitor`, {
         params: { use_gee: useGee, limit: 50 },
-        timeout: useGee ? 300000 : 120000,
+        timeout: useGee ? 300000 : 180000,
       });
       setEwData(res.data);
     } catch (err) {
@@ -565,6 +570,23 @@ function AppContent() {
       setEwData(null);
     } finally {
       setEwLoading(false);
+    }
+  };
+
+  const fetchBasins = async () => {
+    setBasinsLoading(true);
+    try {
+      const res = await axios.get(`${API_BASE}/early-warning/basins`, { timeout: 60000 });
+      setBasinsData(res.data);
+      if (res.data?.basins?.length && !selectedBasinId) {
+        setSelectedBasinId(res.data.basins[0].id);
+      }
+    } catch (err) {
+      const detail = err?.response?.data?.detail || err.message || 'Failed to load basins';
+      alert(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      setBasinsData(null);
+    } finally {
+      setBasinsLoading(false);
     }
   };
 
@@ -734,6 +756,7 @@ function AppContent() {
           {navItem('analytics', 'Analytics', IconShield)}
           {navItem('population', 'Population', IconInfo)}
           {navItem('flood', 'Flood Monitoring', IconPulseDot)}
+          {navItem('basins', 'GLOF Basins', IconGlobe)}
           {navItem('historical', 'Historical', IconSatellite)}
           {navItem('lakes', 'Lakes Inventory', IconLakes)}
           {navItem('add', 'Register New Lake', IconPlus)}
@@ -786,6 +809,7 @@ function AppContent() {
                 {activeTab === 'analytics' && 'Analytics'}
                 {activeTab === 'population' && 'Population Exposure'}
                 {activeTab === 'flood' && 'Flood Monitoring'}
+                {activeTab === 'basins' && 'GLOF Basins'}
                 {activeTab === 'historical' && 'Historical Analysis'}
                 {activeTab === 'lakes' && 'Lakes Inventory'}
                 {activeTab === 'add' && 'Register New Lake'}
@@ -1641,7 +1665,8 @@ function AppContent() {
                   <div style={{ ...cardStyle, padding: 48, textAlign: 'center', color: pal.mid }}>
                     Click <strong style={{ color: pal.accent }}>Run Early Warning Scan</strong> to score all registered lakes.
                     <div style={{ marginTop: 10, fontSize: 12.5 }}>
-                      Fast mode uses area + elevation + glacier proximity. Enable GEE for growth rate and population.
+                      Fast mode always includes elevation, glacier proximity, temperature, flood impact & prediction.
+                      Enable GEE for satellite growth + WorldPop population.
                     </div>
                   </div>
                 )}
@@ -1652,8 +1677,27 @@ function AppContent() {
                   </div>
                 )}
 
-                {ewData && !ewLoading && (
-                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.15fr) minmax(280px, 0.85fr)', gap: 20 }}>
+                {ewData && !ewLoading && (() => {
+                  const PRED_COLOR = { High: '#f0433a', Likely: '#f5a524', Possible: '#38bdf8', Unlikely: '#2dd48e' };
+                  const predCounts = ewData.prediction_counts || {};
+                  const impact = selected?.flood_impact;
+                  const pred = selected?.flood_prediction;
+                  const temp = selected?.temperature;
+                  return (
+                  <>
+                  {/* Prediction KPI strip */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 12 }}>
+                    {['High', 'Likely', 'Possible', 'Unlikely'].map((lvl) => (
+                      <div key={lvl} style={{ ...cardStyle, padding: '14px 16px' }}>
+                        <div className="mono-label" style={{ fontSize: 10, color: pal.mid, marginBottom: 4 }}>Flood pred. · {lvl}</div>
+                        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 24, fontWeight: 700, color: PRED_COLOR[lvl] }}>
+                          {predCounts[lvl] ?? 0}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.15fr) minmax(300px, 0.85fr)', gap: 20 }}>
                     {/* Table */}
                     <div style={{ ...cardStyle, padding: 20, overflow: 'hidden' }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
@@ -1677,7 +1721,7 @@ function AppContent() {
                         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                           <thead>
                             <tr style={{ background: pal.panelAlt }}>
-                              {['#', 'Lake', 'Score', 'Level', 'Area', 'Elev.', 'Glacier'].map((h) => (
+                              {['#', 'Lake', 'Score', 'Level', 'Flood pred.', 'People', 'Impact area', 'Temp'].map((h) => (
                                 <th key={h} className="mono-label" style={{ padding: '10px 12px', fontSize: 10.5, color: pal.mid, textAlign: 'left' }}>{h}</th>
                               ))}
                             </tr>
@@ -1685,12 +1729,17 @@ function AppContent() {
                           <tbody>
                             {board.length === 0 ? (
                               <tr>
-                                <td colSpan={7} style={{ padding: 28, textAlign: 'center', color: pal.mid }}>No lakes in this class</td>
+                                <td colSpan={8} style={{ padding: 28, textAlign: 'center', color: pal.mid }}>No lakes in this class</td>
                               </tr>
                             ) : board.map((row, i) => {
                               const level = row.early_warning?.level || 'Normal';
                               const color = LEVEL_COLOR[level] || pal.mid;
+                              const pl = row.flood_prediction?.likelihood || '—';
+                              const pc = PRED_COLOR[pl] || pal.mid;
                               const active = selected?.lake_id === row.lake_id;
+                              const people = row.flood_impact?.warning_population ?? row.flood_impact?.danger_population;
+                              const impactKm2 = row.flood_impact?.footprint?.warning_area_km2;
+                              const t = row.temperature?.temperature_c;
                               return (
                                 <tr
                                   key={row.lake_id || i}
@@ -1716,18 +1765,17 @@ function AppContent() {
                                       {level}
                                     </span>
                                   </td>
-                                  <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: pal.mid, fontSize: 12.5 }}>
-                                    {row.area_ha != null ? `${row.area_ha} ha` : '—'}
+                                  <td style={{ padding: '10px 12px' }}>
+                                    <span style={{ fontWeight: 700, fontSize: 12, color: pc }}>{pl}</span>
                                   </td>
                                   <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: pal.mid, fontSize: 12.5 }}>
-                                    {row.early_warning?.inputs?.elevation_m != null
-                                      ? `${Math.round(row.early_warning.inputs.elevation_m)} m`
-                                      : '—'}
+                                    {people != null ? Number(people).toLocaleString() : '—'}
                                   </td>
                                   <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: pal.mid, fontSize: 12.5 }}>
-                                    {row.early_warning?.inputs?.glacier_distance_km != null
-                                      ? `${row.early_warning.inputs.glacier_distance_km.toFixed?.(1) ?? row.early_warning.inputs.glacier_distance_km} km`
-                                      : '—'}
+                                    {impactKm2 != null ? `${impactKm2} km²` : '—'}
+                                  </td>
+                                  <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: pal.mid, fontSize: 12.5 }}>
+                                    {t != null ? `${t}°C` : '—'}
                                   </td>
                                 </tr>
                               );
@@ -1738,14 +1786,17 @@ function AppContent() {
                     </div>
 
                     {/* Detail panel */}
-                    <div style={{ ...cardStyle, padding: 20 }}>
+                    <div style={{ ...cardStyle, padding: 20, maxHeight: 640, overflowY: 'auto' }}>
                       {!selected ? (
-                        <div style={{ color: pal.mid, padding: 24, textAlign: 'center' }}>Select a lake for indicator breakdown</div>
+                        <div style={{ color: pal.mid, padding: 24, textAlign: 'center' }}>Select a lake for impact & prediction</div>
                       ) : (
                         <>
                           <div style={eyebrow}>Lake Profile</div>
                           <h3 style={{ ...sectionTitle, marginBottom: 4 }}>{selected.name}</h3>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
+                          <div style={{ fontSize: 12.5, color: pal.mid, marginBottom: 10 }}>
+                            {selected.basin?.name || 'Basin unassigned'} · {selected.basin?.river || ''}
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
                             <span style={{
                               fontFamily: 'var(--font-mono)', fontSize: 28, fontWeight: 800,
                               color: LEVEL_COLOR[ew?.level] || pal.signal
@@ -1759,10 +1810,96 @@ function AppContent() {
                             }}>
                               {ew?.level || '—'}
                             </span>
+                            {pred && (
+                              <span style={{
+                                padding: '4px 12px', borderRadius: 20, fontWeight: 800, fontSize: 12,
+                                background: `${PRED_COLOR[pred.likelihood] || pal.mid}22`,
+                                color: PRED_COLOR[pred.likelihood] || pal.mid
+                              }}>
+                                Flood: {pred.likelihood}
+                              </span>
+                            )}
                           </div>
-                          <p style={{ margin: '0 0 16px', fontSize: 13.5, color: pal.mid, lineHeight: 1.5 }}>
+                          <p style={{ margin: '0 0 14px', fontSize: 13.5, color: pal.mid, lineHeight: 1.5 }}>
                             {ew?.advice}
                           </p>
+
+                          {/* Flood impact card */}
+                          <div style={{
+                            marginBottom: 14, padding: 14, borderRadius: 12,
+                            border: `1px solid ${pal.border}`, background: pal.panelAlt
+                          }}>
+                            <div style={eyebrow}>If this lake floods — impact</div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 8 }}>
+                              <div>
+                                <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>People (danger zone)</div>
+                                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 800, color: '#f0433a', fontSize: 18 }}>
+                                  {(impact?.danger_population ?? 0).toLocaleString()}
+                                </div>
+                              </div>
+                              <div>
+                                <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>People (warning zone)</div>
+                                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 800, color: '#f5a524', fontSize: 18 }}>
+                                  {(impact?.warning_population ?? 0).toLocaleString()}
+                                </div>
+                              </div>
+                              <div>
+                                <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>Danger area</div>
+                                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, color: pal.hi }}>
+                                  {impact?.footprint?.danger_area_km2 ?? '—'} km²
+                                </div>
+                                <div style={{ fontSize: 11, color: pal.lo }}>r ≈ {impact?.footprint?.danger_radius_km ?? '—'} km</div>
+                              </div>
+                              <div>
+                                <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>Warning area</div>
+                                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, color: pal.hi }}>
+                                  {impact?.footprint?.warning_area_km2 ?? '—'} km²
+                                </div>
+                                <div style={{ fontSize: 11, color: pal.lo }}>r ≈ {impact?.footprint?.warning_radius_km ?? '—'} km</div>
+                              </div>
+                              <div>
+                                <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>Est. water volume</div>
+                                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, color: pal.signal }}>
+                                  {impact?.estimated_volume_million_m3 != null
+                                    ? `${impact.estimated_volume_million_m3} M m³`
+                                    : '—'}
+                                </div>
+                              </div>
+                              <div>
+                                <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>Temperature</div>
+                                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, color: pal.hi }}>
+                                  {temp?.temperature_c != null ? `${temp.temperature_c}°C` : '—'}
+                                </div>
+                                <div style={{ fontSize: 11, color: pal.lo }}>
+                                  max 3d: {temp?.forecast_max_c != null ? `${temp.forecast_max_c}°C` : '—'}
+                                </div>
+                              </div>
+                            </div>
+                            {impact?.at_risk_settlements?.length > 0 && (
+                              <div style={{ marginTop: 10, fontSize: 12, color: pal.mid }}>
+                                <strong style={{ color: pal.hi }}>Settlements:</strong> {impact.at_risk_settlements.join(', ')}
+                              </div>
+                            )}
+                            <div style={{ marginTop: 8, fontSize: 11, color: pal.lo }}>{impact?.notes}</div>
+                          </div>
+
+                          {/* Prediction */}
+                          {pred && (
+                            <div style={{
+                              marginBottom: 14, padding: 14, borderRadius: 12,
+                              border: `1px solid ${pal.border}`, borderLeft: `4px solid ${PRED_COLOR[pred.likelihood] || pal.mid}`,
+                              background: pal.panelAlt
+                            }}>
+                              <div style={eyebrow}>Flood prediction</div>
+                              <div style={{ fontWeight: 800, color: PRED_COLOR[pred.likelihood], marginTop: 4 }}>
+                                {pred.likelihood} · score {pred.score}
+                              </div>
+                              <p style={{ margin: '6px 0 8px', fontSize: 13, color: pal.mid }}>{pred.advice}</p>
+                              <div style={{ fontSize: 11.5, color: pal.lo }}>
+                                Uses historical growth (if GEE), temperature / melt stress, glacier proximity, lake size, and early-warning score.
+                              </div>
+                            </div>
+                          )}
 
                           <div style={eyebrow}>Indicator Breakdown</div>
                           <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 8 }}>
@@ -1776,7 +1913,7 @@ function AppContent() {
                                       {ind.points}/{ind.max}
                                     </span>
                                   </div>
-                                  <div style={{ height: 8, borderRadius: 99, background: pal.panelAlt, overflow: 'hidden', border: `1px solid ${pal.border}` }}>
+                                  <div style={{ height: 8, borderRadius: 99, background: isDark ? '#0a1520' : '#e8eef3', overflow: 'hidden', border: `1px solid ${pal.border}` }}>
                                     <div style={{
                                       width: `${pct}%`, height: '100%', borderRadius: 99,
                                       background: 'linear-gradient(90deg,#5eead4,#38bdf8)'
@@ -1794,36 +1931,56 @@ function AppContent() {
                               <div>Elevation: {selected.data_sources?.elevation || '—'}</div>
                               <div>Growth: {selected.data_sources?.growth || '—'}</div>
                               <div>Population: {selected.data_sources?.population || '—'}</div>
-                              <div>Glacier: {selected.data_sources?.glacier || '—'}</div>
+                              <div>Temperature: {selected.data_sources?.temperature || '—'}</div>
                               <div>GEE ready: {selected.data_sources?.gee_ready ? 'yes' : 'no'}</div>
                             </div>
                           </div>
 
-                          {selected.latitude && selected.longitude && (
-                            <motion.button
-                              className="btn-3d"
-                              whileHover={{ scale: 1.02 }}
-                              whileTap={{ scale: 0.98 }}
-                              onClick={() => {
-                                setHistLakeId(String(selected.lake_id));
-                                setActiveTab('historical');
-                                const lake = lakes.find((l) => l.id === selected.lake_id);
-                                if (lake) fetchHistorical(lake);
-                              }}
-                              style={{
-                                marginTop: 16, width: '100%', padding: '10px 14px', borderRadius: 10, border: 'none',
-                                background: 'linear-gradient(135deg,#5eead4,#38bdf8)', color: '#06131a',
-                                fontWeight: 800, fontSize: 12, cursor: 'pointer'
-                              }}
-                            >
-                              Open Historical Analysis
-                            </motion.button>
-                          )}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 14 }}>
+                            {selected.latitude && selected.longitude && (
+                              <motion.button
+                                className="btn-3d"
+                                whileHover={{ scale: 1.02 }}
+                                whileTap={{ scale: 0.98 }}
+                                onClick={() => {
+                                  setHistLakeId(String(selected.lake_id));
+                                  setActiveTab('historical');
+                                  const lake = lakes.find((l) => l.id === selected.lake_id);
+                                  if (lake) fetchHistorical(lake);
+                                }}
+                                style={{
+                                  width: '100%', padding: '10px 14px', borderRadius: 10, border: 'none',
+                                  background: 'linear-gradient(135deg,#5eead4,#38bdf8)', color: '#06131a',
+                                  fontWeight: 800, fontSize: 12, cursor: 'pointer'
+                                }}
+                              >
+                                Open Historical Analysis
+                              </motion.button>
+                            )}
+                            {selected.basin?.id && (
+                              <button
+                                onClick={() => {
+                                  setSelectedBasinId(selected.basin.id);
+                                  setActiveTab('basins');
+                                  if (!basinsData) fetchBasins();
+                                }}
+                                style={{
+                                  width: '100%', padding: '10px 14px', borderRadius: 10,
+                                  border: `1px solid ${pal.border}`, background: pal.panelAlt,
+                                  color: pal.signal, fontWeight: 700, fontSize: 12, cursor: 'pointer'
+                                }}
+                              >
+                                View GLOF Basin
+                              </button>
+                            )}
+                          </div>
                         </>
                       )}
                     </div>
                   </div>
-                )}
+                  </>
+                  );
+                })()}
 
                 {/* Legend */}
                 <div style={{ ...cardStyle, padding: 20 }}>
@@ -1847,6 +2004,262 @@ function AppContent() {
                     ))}
                   </div>
                 </div>
+              </div>
+            );
+          })()}
+
+          {/* GLOF BASINS */}
+          {activeTab === 'basins' && (() => {
+            const PRIO_COLOR = { Critical: '#f0433a', Warning: '#f5a524', Watch: '#38bdf8', Normal: '#2dd48e' };
+            const basins = basinsData?.basins || [];
+            const selected = basins.find((b) => b.id === selectedBasinId) || basins[0] || null;
+
+            return (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+                <div style={{ ...cardStyle, padding: 24 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' }}>
+                    <div>
+                      <div style={eyebrow}>Drainage & Storage Corridors</div>
+                      <h3 style={{ ...sectionTitle, marginBottom: 8 }}>GLOF Basins</h3>
+                      <p style={{ margin: 0, color: pal.mid, fontSize: 13.5, maxWidth: 760, lineHeight: 1.55 }}>
+                        Where outburst water is likely to <strong>route and temporarily store</strong> after a GLOF —
+                        valleys, gorges, plains, and confluences — plus lakes assigned to each catchment,
+                        estimated water volume, cascade notes, and settlements at risk.
+                      </p>
+                    </div>
+                    <motion.button
+                      className="btn-3d"
+                      whileHover={{ scale: 1.03 }}
+                      whileTap={{ scale: 0.97 }}
+                      disabled={basinsLoading}
+                      onClick={fetchBasins}
+                      style={{
+                        padding: '11px 18px', borderRadius: 12, border: 'none',
+                        background: basinsLoading ? '#94a3b8' : 'linear-gradient(135deg,#5eead4,#38bdf8)',
+                        color: '#06131a', fontWeight: 800, fontSize: 13, cursor: 'pointer'
+                      }}
+                    >
+                      {basinsLoading ? 'Loading basins…' : basinsData ? 'Refresh Basins' : 'Load GLOF Basins'}
+                    </motion.button>
+                  </div>
+                </div>
+
+                {!basinsData && !basinsLoading && (
+                  <div style={{ ...cardStyle, padding: 48, textAlign: 'center', color: pal.mid }}>
+                    Click <strong style={{ color: pal.accent }}>Load GLOF Basins</strong> to map lakes into drainage corridors and storage nodes.
+                  </div>
+                )}
+
+                {basinsLoading && (
+                  <div style={{ ...cardStyle, padding: 40, textAlign: 'center', color: pal.mid }}>Loading basin catalogue…</div>
+                )}
+
+                {basinsData && !basinsLoading && (
+                  <>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12 }}>
+                      <div style={{ ...cardStyle, padding: '16px 18px' }}>
+                        <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>Basins</div>
+                        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 26, fontWeight: 700, color: pal.signal }}>{basinsData.total_basins}</div>
+                      </div>
+                      <div style={{ ...cardStyle, padding: '16px 18px' }}>
+                        <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>Lakes assigned</div>
+                        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 26, fontWeight: 700, color: pal.hi }}>
+                          {basins.reduce((s, b) => s + (b.lake_count || 0), 0)}
+                        </div>
+                      </div>
+                      <div style={{ ...cardStyle, padding: '16px 18px' }}>
+                        <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>Critical basins</div>
+                        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 26, fontWeight: 700, color: '#f0433a' }}>
+                          {basins.filter((b) => b.monitoring_priority === 'Critical').length}
+                        </div>
+                      </div>
+                      <div style={{ ...cardStyle, padding: '16px 18px' }}>
+                        <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>Est. total volume</div>
+                        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 22, fontWeight: 700, color: pal.accent }}>
+                          {basins.reduce((s, b) => s + (b.total_estimated_outburst_volume_million_m3 || 0), 0).toFixed(1)} M m³
+                        </div>
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 0.9fr) minmax(0, 1.1fr)', gap: 20 }}>
+                      {/* Basin list */}
+                      <div style={{ ...cardStyle, padding: 16, maxHeight: 640, overflowY: 'auto' }}>
+                        <div style={eyebrow}>Catchments</div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+                          {basins.map((b) => {
+                            const active = selected?.id === b.id;
+                            const pc = PRIO_COLOR[b.monitoring_priority] || pal.mid;
+                            return (
+                              <button
+                                key={b.id}
+                                onClick={() => setSelectedBasinId(b.id)}
+                                style={{
+                                  textAlign: 'left', padding: '12px 14px', borderRadius: 12, cursor: 'pointer',
+                                  border: active ? `1.5px solid ${pc}` : `1px solid ${pal.border}`,
+                                  background: active ? (isDark ? 'rgba(56,189,248,0.1)' : 'rgba(2,132,199,0.06)') : pal.panelAlt,
+                                  color: pal.hi,
+                                }}
+                              >
+                                <div style={{ fontWeight: 700, fontSize: 14 }}>{b.name}</div>
+                                <div style={{ fontSize: 11.5, color: pal.mid, marginTop: 4 }}>{b.river}</div>
+                                <div style={{ display: 'flex', gap: 10, marginTop: 8, fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>
+                                  <span style={{ color: pc, fontWeight: 700 }}>{b.monitoring_priority}</span>
+                                  <span style={{ color: pal.lo }}>{b.lake_count} lakes</span>
+                                  <span style={{ color: pal.lo }}>{b.total_estimated_outburst_volume_million_m3 || 0} M m³</span>
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Basin detail */}
+                      <div style={{ ...cardStyle, padding: 22 }}>
+                        {!selected ? (
+                          <div style={{ color: pal.mid, textAlign: 'center', padding: 40 }}>Select a basin</div>
+                        ) : (
+                          <>
+                            <div style={eyebrow}>Basin dossier</div>
+                            <h3 style={{ ...sectionTitle, marginBottom: 6 }}>{selected.name}</h3>
+                            <div style={{ fontSize: 13, color: pal.mid, marginBottom: 12 }}>{selected.river}</div>
+                            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
+                              <span style={{
+                                padding: '4px 12px', borderRadius: 20, fontWeight: 800, fontSize: 12,
+                                background: `${PRIO_COLOR[selected.monitoring_priority]}22`,
+                                color: PRIO_COLOR[selected.monitoring_priority]
+                              }}>
+                                Priority: {selected.monitoring_priority}
+                              </span>
+                              <span style={{
+                                padding: '4px 12px', borderRadius: 20, fontWeight: 700, fontSize: 12,
+                                background: pal.panelAlt, color: pal.hi, border: `1px solid ${pal.border}`
+                              }}>
+                                {selected.lake_count} lakes
+                              </span>
+                              {selected.area_km2_approx && (
+                                <span style={{
+                                  padding: '4px 12px', borderRadius: 20, fontWeight: 700, fontSize: 12,
+                                  background: pal.panelAlt, color: pal.mid, border: `1px solid ${pal.border}`
+                                }}>
+                                  ~{selected.area_km2_approx.toLocaleString()} km²
+                                </span>
+                              )}
+                            </div>
+
+                            <div style={{
+                              display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16
+                            }}>
+                              <div style={{ padding: 12, borderRadius: 12, background: pal.panelAlt, border: `1px solid ${pal.border}` }}>
+                                <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>Lake surface area</div>
+                                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 800, color: pal.signal, fontSize: 18 }}>
+                                  {selected.total_lake_area_ha ?? 0} ha
+                                </div>
+                              </div>
+                              <div style={{ padding: 12, borderRadius: 12, background: pal.panelAlt, border: `1px solid ${pal.border}` }}>
+                                <div className="mono-label" style={{ fontSize: 10, color: pal.mid }}>Est. outburst volume</div>
+                                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 800, color: '#f5a524', fontSize: 18 }}>
+                                  {selected.total_estimated_outburst_volume_million_m3 ?? 0} M m³
+                                </div>
+                              </div>
+                            </div>
+
+                            <div style={eyebrow}>Where water stores / routes</div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, margin: '8px 0 16px' }}>
+                              {(selected.downstream_storage || []).map((node, i) => (
+                                <div key={i} style={{
+                                  padding: '10px 12px', borderRadius: 10, border: `1px solid ${pal.border}`,
+                                  background: isDark ? 'rgba(94,234,212,0.06)' : '#f0fdfa'
+                                }}>
+                                  <div style={{ fontWeight: 700, color: pal.hi, fontSize: 13.5 }}>{node.name}</div>
+                                  <div style={{ fontSize: 11.5, color: pal.mid, marginTop: 2 }}>
+                                    Type: {node.type?.replace(/_/g, ' ')}
+                                    {node.lat != null && ` · ${node.lat.toFixed(2)}°N, ${node.lon.toFixed(2)}°E`}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+
+                            <div style={eyebrow}>Settlements at risk</div>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, margin: '8px 0 16px' }}>
+                              {(selected.at_risk_settlements || []).map((s) => (
+                                <span key={s} style={{
+                                  padding: '4px 10px', borderRadius: 999, fontSize: 12, fontWeight: 600,
+                                  background: isDark ? 'rgba(240,67,58,0.12)' : '#fef2f2', color: '#f0433a',
+                                  border: '1px solid rgba(240,67,58,0.25)'
+                                }}>
+                                  {s}
+                                </span>
+                              ))}
+                            </div>
+
+                            <div style={eyebrow}>Cascade notes</div>
+                            <p style={{ margin: '6px 0 16px', fontSize: 13.5, color: pal.mid, lineHeight: 1.55 }}>
+                              {selected.cascade_notes}
+                            </p>
+
+                            <div style={eyebrow}>Lakes in this basin</div>
+                            <div style={{ overflowX: 'auto', marginTop: 8 }}>
+                              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                                <thead>
+                                  <tr style={{ background: pal.panelAlt }}>
+                                    {['Name', 'Area', 'Est. volume'].map((h) => (
+                                      <th key={h} className="mono-label" style={{ padding: '8px 10px', fontSize: 10, color: pal.mid, textAlign: 'left' }}>{h}</th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {(selected.lakes || []).length === 0 ? (
+                                    <tr><td colSpan={3} style={{ padding: 16, color: pal.mid }}>No inventory lakes in this bbox</td></tr>
+                                  ) : selected.lakes.map((l) => (
+                                    <tr key={l.id} style={{ borderBottom: `1px solid ${pal.border}` }}>
+                                      <td style={{ padding: '8px 10px', fontWeight: 600, color: pal.hi }}>{l.name}</td>
+                                      <td style={{ padding: '8px 10px', fontFamily: 'var(--font-mono)', color: pal.mid, fontSize: 12 }}>
+                                        {l.area_ha != null ? `${l.area_ha} ha` : '—'}
+                                      </td>
+                                      <td style={{ padding: '8px 10px', fontFamily: 'var(--font-mono)', color: pal.signal, fontSize: 12 }}>
+                                        {l.estimated_volume_m3 != null
+                                          ? `${(l.estimated_volume_m3 / 1e6).toFixed(2)} M m³`
+                                          : '—'}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+
+                            {selected.lakes?.length > 0 && (
+                              <div style={{ height: 260, marginTop: 16, borderRadius: 12, overflow: 'hidden', border: `1px solid ${pal.border}` }}>
+                                <MapView
+                                  selectedRisk="All"
+                                  setSelectedRisk={() => {}}
+                                  lakes={selected.lakes.map((l) => ({
+                                    id: l.id,
+                                    name: l.name,
+                                    area_ha: l.area_ha,
+                                    latitude: l.latitude,
+                                    longitude: l.longitude,
+                                    risk_level: calculateRisk(l.area_ha || 0),
+                                  }))}
+                                  setSelectedLake={openLakeDetails}
+                                  loading={false}
+                                />
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {(basinsData.notes || []).length > 0 && (
+                      <div style={{ ...cardStyle, padding: 18 }}>
+                        <div style={eyebrow}>Method notes</div>
+                        <ul style={{ margin: '8px 0 0', paddingLeft: 18, color: pal.mid, fontSize: 13, lineHeight: 1.55 }}>
+                          {basinsData.notes.map((n, i) => <li key={i}>{n}</li>)}
+                        </ul>
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
             );
           })()}

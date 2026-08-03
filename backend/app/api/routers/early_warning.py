@@ -20,6 +20,8 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.models.lake import Lake as LakeModel
 from app.services.early_warning import compute_early_warning, classify_level
+from app.services.flood_impact import build_flood_impact, predict_flood_likelihood, fetch_temperature
+from app.services.glof_basins import BASINS, assign_basin, basin_summary_for_lakes, estimate_outburst_volume_m3
 from app.utils.gee_detection import GEE_READY, _init_ee, gee_status
 
 limiter = Limiter(key_func=get_remote_address)
@@ -160,27 +162,46 @@ def fetch_growth_from_gee(lat: float, lon: float) -> Optional[float]:
         return None
 
 
+def _population_heuristic(lat: float, lon: float, area_ha: Optional[float]) -> dict:
+    """Planning-grade population if GEE WorldPop is offline."""
+    import math
+    from app.utils.risk import calculate_risk
+    risk = calculate_risk(area_ha or 0)
+    d_km, w_km = (5.0, 10.0) if risk == "High" else ((2.0, 5.0) if risk == "Medium" else (1.0, 2.0))
+    # Valley density heuristic (people/km²) for GB corridor settlements
+    dens = 95.0
+    danger_pop = int(math.pi * (d_km ** 2) * dens * 0.35)  # 35% habitable fraction
+    warning_pop = int(math.pi * (w_km ** 2) * dens * 0.35)
+    return {
+        "danger_population": danger_pop,
+        "warning_population": max(warning_pop, danger_pop),
+        "source": "heuristic valley density (GEE offline)",
+        "risk_level": risk,
+    }
+
+
 def fetch_population_exposure(lat: float, lon: float, area_ha: Optional[float]) -> dict:
-    """Use GEE WorldPop when available; otherwise 0 with note."""
+    """Use GEE WorldPop when available; heuristic fallback so impact is never blank."""
     from app.utils.risk import calculate_risk
     risk = calculate_risk(area_ha or 0)
     if not GEE_READY and not _init_ee():
-        return {
-            "danger_population": 0,
-            "warning_population": 0,
-            "source": "unavailable",
-            "risk_level": risk,
-        }
+        return _population_heuristic(lat, lon, area_ha)
     try:
         from app.utils.gee_detection import estimate_lake_exposure
-        return estimate_lake_exposure(lat, lon, risk)
+        res = estimate_lake_exposure(lat, lon, risk)
+        # If GEE returns zeros/errors, still provide heuristic floor for UX
+        if res.get("error") or (
+            int(res.get("danger_population") or 0) == 0
+            and int(res.get("warning_population") or 0) == 0
+        ):
+            h = _population_heuristic(lat, lon, area_ha)
+            h["source"] = f"heuristic (GEE empty/error: {res.get('error') or 'zero pop'})"
+            return h
+        return res
     except Exception as e:
-        return {
-            "danger_population": 0,
-            "warning_population": 0,
-            "source": f"error: {e}",
-            "risk_level": risk,
-        }
+        h = _population_heuristic(lat, lon, area_ha)
+        h["source"] = f"heuristic (GEE error: {e})"
+        return h
 
 
 def assess_lake(
@@ -195,24 +216,41 @@ def assess_lake(
 ) -> dict:
     if lat is None or lon is None:
         result = compute_early_warning(area_ha=area_ha, include_glacier=False)
+        impact = build_flood_impact(area_ha=area_ha, lat=None, lon=None)
+        prediction = predict_flood_likelihood(
+            early_warning_score=result.get("score") or 0,
+            early_warning_level=result.get("level") or "Normal",
+            growth_pct_per_year=None,
+            temperature_c=None,
+            forecast_max_c=None,
+            elevation_m=None,
+            glacier_distance_km=None,
+            area_ha=area_ha,
+        )
         return {
             "lake_id": lake_id,
             "name": name,
             "latitude": lat,
             "longitude": lon,
             "early_warning": result,
+            "flood_impact": impact,
+            "flood_prediction": prediction,
             "data_sources": {"note": "Missing coordinates — area-only score"},
         }
 
     elevation_m, elevation_source = fetch_elevation_m(lat, lon)
     glacier_km = round(nearest_glacier_km(lat, lon), 2)
+    temp = fetch_temperature(lat, lon)
 
     growth = None
-    pop = {"danger_population": 0, "warning_population": 0, "source": "skipped"}
     if use_gee:
         growth = fetch_growth_from_gee(lat, lon)
-        if include_population:
-            pop = fetch_population_exposure(lat, lon, area_ha)
+    # Population always estimated (GEE WorldPop when possible, else heuristic)
+    pop = (
+        fetch_population_exposure(lat, lon, area_ha)
+        if include_population
+        else _population_heuristic(lat, lon, area_ha)
+    )
 
     result = compute_early_warning(
         area_ha=area_ha,
@@ -224,6 +262,25 @@ def assess_lake(
         include_glacier=True,
     )
 
+    impact = build_flood_impact(
+        area_ha=area_ha,
+        lat=lat,
+        lon=lon,
+        danger_population=int(pop.get("danger_population") or 0),
+        warning_population=int(pop.get("warning_population") or 0),
+    )
+    prediction = predict_flood_likelihood(
+        early_warning_score=result.get("score") or 0,
+        early_warning_level=result.get("level") or "Normal",
+        growth_pct_per_year=growth,
+        temperature_c=temp.get("temperature_c"),
+        forecast_max_c=temp.get("forecast_max_c"),
+        elevation_m=elevation_m,
+        glacier_distance_km=glacier_km,
+        area_ha=area_ha,
+    )
+    basin = assign_basin(lat, lon)
+
     return {
         "lake_id": lake_id,
         "name": name,
@@ -231,11 +288,21 @@ def assess_lake(
         "longitude": lon,
         "area_ha": area_ha,
         "early_warning": result,
+        "flood_impact": impact,
+        "flood_prediction": prediction,
+        "temperature": temp,
+        "basin": {
+            "id": basin["id"],
+            "name": basin["name"],
+            "river": basin["river"],
+            "monitoring_priority": basin.get("monitoring_priority"),
+        },
         "data_sources": {
             "elevation": elevation_source,
             "growth": "GEE Sentinel-2 NDWI" if growth is not None else "unavailable",
             "population": pop.get("source"),
             "glacier": "reference glacier points (GB)",
+            "temperature": temp.get("source"),
             "gee_ready": bool(GEE_READY or _init_ee()),
         },
     }
@@ -321,7 +388,7 @@ def monitor_all_lakes(
             lat=lake.latitude,
             lon=lake.longitude,
             use_gee=use_gee,
-            include_population=use_gee,
+            include_population=True,  # always estimate people/area impact
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -353,10 +420,101 @@ def monitor_all_lakes(
         if lvl in counts:
             counts[lvl] += 1
 
+    pred_counts = {"High": 0, "Likely": 0, "Possible": 0, "Unlikely": 0}
+    for r in results:
+        pl = (r.get("flood_prediction") or {}).get("likelihood")
+        if pl in pred_counts:
+            pred_counts[pl] += 1
+
     return {
         "total": len(results),
         "counts": counts,
+        "prediction_counts": pred_counts,
         "use_gee": use_gee,
         "gee": gee_status(),
         "lakes": results,
+        "basins": basin_summary_for_lakes(results),
+    }
+
+
+@router.get("/basins")
+@limiter.limit("30/minute")
+def list_basins(request: Request, db: Session = Depends(get_db)):
+    """
+    GLOF basin catalogue: drainage corridors, storage nodes, and lakes assigned
+    to each basin from the inventory.
+    """
+    lakes = db.query(LakeModel).all()
+    by_basin: dict[str, list] = {b["id"]: [] for b in BASINS}
+    for lake in lakes:
+        basin = assign_basin(lake.latitude, lake.longitude)
+        by_basin.setdefault(basin["id"], []).append({
+            "id": lake.id,
+            "name": lake.name,
+            "area_ha": lake.area_ha,
+            "latitude": lake.latitude,
+            "longitude": lake.longitude,
+            "estimated_volume_m3": estimate_outburst_volume_m3(lake.area_ha),
+        })
+
+    payload = []
+    for basin in BASINS:
+        if basin.get("is_fallback") and not by_basin.get(basin["id"]):
+            continue
+        lake_list = by_basin.get(basin["id"], [])
+        total_area = sum(float(l.get("area_ha") or 0) for l in lake_list)
+        total_vol = sum(float(l.get("estimated_volume_m3") or 0) for l in lake_list)
+        payload.append({
+            **{k: v for k, v in basin.items() if k != "bbox"},
+            "bbox": basin["bbox"],
+            "lake_count": len(lake_list),
+            "lakes": sorted(lake_list, key=lambda x: float(x.get("area_ha") or 0), reverse=True),
+            "total_lake_area_ha": round(total_area, 1),
+            "total_estimated_outburst_volume_m3": round(total_vol, 0),
+            "total_estimated_outburst_volume_million_m3": round(total_vol / 1e6, 3) if total_vol else 0,
+        })
+
+    # Priority order
+    prio = {"Critical": 0, "Warning": 1, "Watch": 2, "Normal": 3}
+    payload.sort(key=lambda b: (prio.get(b.get("monitoring_priority"), 9), -b.get("lake_count", 0)))
+    return {
+        "total_basins": len(payload),
+        "basins": payload,
+        "notes": [
+            "Basins are planning polygons for GB / Northern Pakistan catchments.",
+            "Downstream storage nodes are valleys, gorges, and plains where outburst water can temporarily pond or route.",
+            "Volumes assume mean depth ~12 m (heuristic — not bathymetry).",
+            "Use with Flood Monitoring scores for operational prioritisation.",
+        ],
+    }
+
+
+@router.get("/basins/{basin_id}")
+@limiter.limit("30/minute")
+def get_basin(request: Request, basin_id: str, db: Session = Depends(get_db)):
+    basin = next((b for b in BASINS if b["id"] == basin_id), None)
+    if not basin:
+        raise HTTPException(status_code=404, detail="Basin not found")
+    lakes = db.query(LakeModel).all()
+    assigned = []
+    for lake in lakes:
+        if assign_basin(lake.latitude, lake.longitude)["id"] == basin_id:
+            assigned.append({
+                "id": lake.id,
+                "name": lake.name,
+                "area_ha": lake.area_ha,
+                "latitude": lake.latitude,
+                "longitude": lake.longitude,
+                "estimated_volume_m3": estimate_outburst_volume_m3(lake.area_ha),
+            })
+    total_vol = sum(float(l.get("estimated_volume_m3") or 0) for l in assigned)
+    return {
+        **{k: v for k, v in basin.items()},
+        "lakes": assigned,
+        "lake_count": len(assigned),
+        "total_estimated_outburst_volume_m3": total_vol,
+        "cascade_risk": (
+            "High" if len(assigned) >= 5 or any((l.get("area_ha") or 0) >= 40 for l in assigned)
+            else "Moderate" if assigned else "Low"
+        ),
     }
