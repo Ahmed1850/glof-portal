@@ -430,7 +430,7 @@ def early_warning_status(request: Request):
 
 
 @router.get("/weather")
-@limiter.limit("60/minute")
+@limiter.limit("120/minute")
 def weather_at_point(
     request: Request,
     lat: float = Query(..., description="Latitude"),

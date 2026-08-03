@@ -139,6 +139,19 @@ def _seed_if_empty():
 
 _seed_if_empty()
 
+
+def _warm_weather_cache():
+    """Pre-fetch GB basin weather so first dashboard paint is not null on cold start."""
+    try:
+        from app.services.flood_impact import fetch_current_weather
+        w = fetch_current_weather(35.92, 74.31)
+        print(f"Weather cache warm: {w.get('temperature_c')}°C via {w.get('source')}")
+    except Exception as e:
+        print(f"Weather warm skipped: {e}")
+
+
+_warm_weather_cache()
+
 # Optional SPA bundle (built frontend copied to backend/static for single-service host)
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -147,6 +160,34 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 @limiter.limit("60/minute")
 def health(request: Request):
     return {"status": "ok"}
+
+
+@app.get("/weather")
+@limiter.limit("120/minute")
+def weather_root(
+    request: Request,
+    lat: float = 35.92,
+    lon: float = 74.31,
+):
+    """
+    Dashboard weather (same payload as /early-warning/weather).
+    Short path used by the SPA so temperature never depends on a nested route only.
+    """
+    from app.services.flood_impact import fetch_current_weather
+    w = fetch_current_weather(lat, lon)
+    return {
+        "latitude": lat,
+        "longitude": lon,
+        "temperature_c": w.get("temperature_c"),
+        "temperature_2m": w.get("temperature_2m", w.get("temperature_c")),
+        "forecast_max_c": w.get("forecast_max_c"),
+        "relative_humidity_2m": w.get("relative_humidity_2m"),
+        "precipitation": w.get("precipitation"),
+        "wind_speed_10m": w.get("wind_speed_10m"),
+        "weather_code": w.get("weather_code"),
+        "source": w.get("source"),
+        "cached": w.get("cached", False),
+    }
 
 
 @app.get("/api")
@@ -171,7 +212,7 @@ if STATIC_DIR.is_dir():
     @app.get("/{full_path:path}")
     def spa_fallback(full_path: str):
         """Serve built React app for client-side routes (API routes take priority)."""
-        if full_path.startswith(("lakes", "gee", "risk", "auth", "early-warning", "docs", "openapi", "redoc", "health", "api", "assets")):
+        if full_path.startswith(("lakes", "gee", "risk", "auth", "early-warning", "docs", "openapi", "redoc", "health", "api", "assets", "weather")):
             return JSONResponse({"detail": "Not found"}, status_code=404)
         candidate = STATIC_DIR / full_path
         if candidate.is_file():

@@ -195,42 +195,75 @@ function AppContent() {
       .catch(() => setLoading(false));
   };
 
+  const normalizeWeather = (t, sourceHint) => {
+    if (!t || typeof t !== 'object') return null;
+    const temp = t.temperature_2m ?? t.temperature_c ?? t.temp_C;
+    if (temp == null || Number.isNaN(Number(temp))) return null;
+    return {
+      temperature_2m: Number(temp),
+      relative_humidity_2m:
+        t.relative_humidity_2m != null && !Number.isNaN(Number(t.relative_humidity_2m))
+          ? Number(t.relative_humidity_2m)
+          : null,
+      precipitation:
+        t.precipitation != null && !Number.isNaN(Number(t.precipitation))
+          ? Number(t.precipitation)
+          : 0,
+      weather_code: t.weather_code ?? null,
+      wind_speed_10m:
+        t.wind_speed_10m != null && !Number.isNaN(Number(t.wind_speed_10m))
+          ? Number(t.wind_speed_10m)
+          : null,
+      source: t.source || sourceHint || 'weather',
+    };
+  };
+
   const fetchWeather = async (lat, lon) => {
-    // Prefer backend (cached + multi-provider) so Render does not burn Open-Meteo quota.
-    try {
-      const res = await axios.get(`${API_BASE}/early-warning/weather`, {
-        params: { lat, lon },
-        timeout: 15000,
-      });
-      const t = res.data || {};
-      const temp = t.temperature_2m ?? t.temperature_c;
-      if (temp != null && !Number.isNaN(Number(temp))) {
-        return {
-          temperature_2m: Number(temp),
-          relative_humidity_2m: t.relative_humidity_2m != null ? Number(t.relative_humidity_2m) : null,
-          precipitation: t.precipitation != null ? Number(t.precipitation) : 0,
-          weather_code: t.weather_code ?? null,
-          wind_speed_10m: t.wind_speed_10m != null ? Number(t.wind_speed_10m) : null,
-          source: t.source || 'backend',
-        };
+    // Race backend (Render-safe cache) + browser Open-Meteo so the dashboard
+    // never stays on null when either path works.
+    const backendUrls = [
+      `${API_BASE}/early-warning/weather`,
+      `${API_BASE}/weather`,
+    ].filter((u, i, arr) => arr.indexOf(u) === i);
+
+    const backendPromise = (async () => {
+      let lastErr;
+      for (const url of backendUrls) {
+        try {
+          const res = await axios.get(url, {
+            params: { lat, lon, _t: Date.now() },
+            timeout: 45000,
+          });
+          const w = normalizeWeather(res.data, res.data?.source || 'backend');
+          if (w) return w;
+        } catch (e) {
+          lastErr = e;
+        }
       }
-    } catch {
-      /* fall through to direct Open-Meteo from the browser */
-    }
-    try {
-      const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m&timezone=auto`;
-      const res = await axios.get(url, { timeout: 12000 });
-      return res.data.current;
-    } catch {
+      if (lastErr) throw lastErr;
       return null;
-    }
+    })();
+
+    const openMeteoPromise = (async () => {
+      const url =
+        `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+        `&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m&timezone=auto`;
+      const res = await axios.get(url, { timeout: 15000 });
+      return normalizeWeather(res.data?.current, 'Open-Meteo (browser)');
+    })();
+
+    const results = await Promise.allSettled([backendPromise, openMeteoPromise]);
+    const backend = results[0].status === 'fulfilled' ? results[0].value : null;
+    const browser = results[1].status === 'fulfilled' ? results[1].value : null;
+    // Prefer backend (includes fallbacks + cache); else browser Open-Meteo
+    return backend || browser || null;
   };
 
   const fmtWeather = (v, unit = '') => {
-    if (v == null || Number.isNaN(Number(v))) return '—';
+    if (v == null || v === '' || Number.isNaN(Number(v))) return '—';
     const n = Number(v);
     const shown = Number.isInteger(n) ? String(n) : n.toFixed(1);
-    return unit ? `${shown}${unit}` : shown;
+    return `${shown}${unit}`;
   };
 
   const fetchExposureForLakes = async (lakesList) => {
@@ -341,7 +374,10 @@ function AppContent() {
   useEffect(() => {
     if (enteredPortal) {
       fetchLakes();
-      fetchWeather(35.92, 74.31).then(setDashboardWeather);
+      setDashboardWeather(null);
+      fetchWeather(35.92, 74.31)
+        .then((w) => setDashboardWeather(w))
+        .catch(() => setDashboardWeather(null));
     }
   }, [enteredPortal]);
 
