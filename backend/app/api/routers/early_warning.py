@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -27,6 +30,40 @@ from app.utils.gee_detection import GEE_READY, _init_ee, gee_status
 limiter = Limiter(key_func=get_remote_address)
 
 router = APIRouter(prefix="/early-warning", tags=["Early Warning / Flood Monitoring"])
+
+# ---------------------------------------------------------------------------
+# In-process cache — critical on Render free tier where every GEE getInfo is
+# expensive and HTTP requests are hard-capped (~30s free / ~100s paid).
+# ---------------------------------------------------------------------------
+_CACHE_LOCK = threading.Lock()
+_GROWTH_CACHE: dict[str, tuple[float, Optional[float]]] = {}
+_POP_CACHE: dict[str, tuple[float, dict]] = {}
+_CACHE_TTL_SEC = float(os.getenv("EW_GEE_CACHE_TTL_SEC", str(6 * 3600)))  # 6h
+
+
+def _cache_key(lat: float, lon: float, *parts) -> str:
+    return f"{round(float(lat), 3)}:{round(float(lon), 3)}:" + ":".join(str(p) for p in parts)
+
+
+def _cache_get(store: dict, key: str):
+    with _CACHE_LOCK:
+        item = store.get(key)
+        if not item:
+            return None
+        ts, value = item
+        if time.time() - ts > _CACHE_TTL_SEC:
+            store.pop(key, None)
+            return None
+        return value
+
+
+def _cache_set(store: dict, key: str, value) -> None:
+    with _CACHE_LOCK:
+        store[key] = (time.time(), value)
+
+
+def _is_render() -> bool:
+    return bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID") or os.getenv("RENDER_EXTERNAL_URL"))
 
 # Approximate glacier tongue / icefield reference points across Gilgit-Baltistan
 # Used when GEE glacier distance is unavailable (optional indicator).
@@ -141,30 +178,34 @@ def fetch_elevation_m(lat: float, lon: float) -> Tuple[Optional[float], Optional
 
 
 def fetch_growth_from_gee(lat: float, lon: float) -> Optional[float]:
-    """Percent growth per year from ~5-year Sentinel-2 NDWI series."""
+    """
+    Percent growth per year from a 2-year Sentinel-2 NDWI pair (one GEE getInfo).
+
+    Previously pulled an 11-year series (~11 getInfo calls) which always timed out
+    on Render free tier when scoring many lakes.
+    """
+    key = _cache_key(lat, lon, "growth", 2019, 2024)
+    with _CACHE_LOCK:
+        item = _GROWTH_CACHE.get(key)
+        if item and time.time() - item[0] <= _CACHE_TTL_SEC:
+            return item[1]  # may be None (failed / no water) — still a cache hit
+
     if not GEE_READY and not _init_ee():
         return None
     try:
-        from app.utils.gee_detection import get_historical_areas
-        hist = get_historical_areas(lat, lon)
-        years = [y for y in (hist.get("years") or []) if y.get("area_ha") is not None]
-        if len(years) < 2:
-            return None
-        years = sorted(years, key=lambda y: y["year"])
-        first, last = years[0], years[-1]
-        span = max(1, int(last["year"]) - int(first["year"]))
-        a0, a1 = float(first["area_ha"]), float(last["area_ha"])
-        if a0 <= 0:
-            return 50.0 if a1 > 0 else 0.0
-        total_pct = ((a1 - a0) / a0) * 100.0
-        return round(total_pct / span, 2)
+        from app.utils.gee_detection import estimate_growth_pct_per_year
+        res = estimate_growth_pct_per_year(lat, lon, year_start=2019, year_end=2024)
+        growth = res.get("growth_pct_per_year")
+        if growth is not None:
+            growth = float(growth)
+        _cache_set(_GROWTH_CACHE, key, growth)
+        return growth
     except Exception:
         return None
 
 
 def _population_heuristic(lat: float, lon: float, area_ha: Optional[float]) -> dict:
     """Planning-grade population if GEE WorldPop is offline."""
-    import math
     from app.utils.risk import calculate_risk
     risk = calculate_risk(area_ha or 0)
     d_km, w_km = (5.0, 10.0) if risk == "High" else ((2.0, 5.0) if risk == "Medium" else (1.0, 2.0))
@@ -184,6 +225,11 @@ def fetch_population_exposure(lat: float, lon: float, area_ha: Optional[float]) 
     """Use GEE WorldPop when available; heuristic fallback so impact is never blank."""
     from app.utils.risk import calculate_risk
     risk = calculate_risk(area_ha or 0)
+    key = _cache_key(lat, lon, "pop", risk)
+    cached = _cache_get(_POP_CACHE, key)
+    if cached is not None:
+        return dict(cached)
+
     if not GEE_READY and not _init_ee():
         return _population_heuristic(lat, lon, area_ha)
     try:
@@ -197,6 +243,7 @@ def fetch_population_exposure(lat: float, lon: float, area_ha: Optional[float]) 
             h = _population_heuristic(lat, lon, area_ha)
             h["source"] = f"heuristic (GEE empty/error: {res.get('error') or 'zero pop'})"
             return h
+        _cache_set(_POP_CACHE, key, res)
         return res
     except Exception as e:
         h = _population_heuristic(lat, lon, area_ha)
@@ -249,15 +296,25 @@ def assess_lake(
     temp = shared_temp if shared_temp is not None else fetch_temperature(lat, lon)
 
     growth = None
+    growth_source = None
     if use_gee:
-        # Full multi-source elevation + GEE growth + population
+        # Elevation stays on Open-Meteo first (fast). GEE used only for growth + WorldPop.
         elevation_m, elevation_source = fetch_elevation_m(lat, lon)
-        growth = fetch_growth_from_gee(lat, lon)
-        pop = (
-            fetch_population_exposure(lat, lon, area_ha)
-            if include_population
-            else _population_heuristic(lat, lon, area_ha)
-        )
+        try:
+            growth = fetch_growth_from_gee(lat, lon)
+            growth_source = "GEE Sentinel-2 NDWI (2-year fast)" if growth is not None else "GEE growth unavailable"
+        except Exception as e:
+            growth = None
+            growth_source = f"GEE growth error: {e}"
+        try:
+            pop = (
+                fetch_population_exposure(lat, lon, area_ha)
+                if include_population
+                else _population_heuristic(lat, lon, area_ha)
+            )
+        except Exception as e:
+            pop = _population_heuristic(lat, lon, area_ha)
+            pop["source"] = f"heuristic (GEE pop error: {e})"
     else:
         # FAST: never call GEE (avoids timeout / hang on Render free tier)
         elevation_m = fetch_elevation_open_meteo(lat, lon)
@@ -270,6 +327,7 @@ def assess_lake(
             "warning_population": 0,
             "source": "skipped",
         }
+        growth_source = "skipped (fast mode)"
 
     result = compute_early_warning(
         area_ha=area_ha,
@@ -318,7 +376,9 @@ def assess_lake(
         },
         "data_sources": {
             "elevation": elevation_source,
-            "growth": "GEE Sentinel-2 NDWI" if growth is not None else "unavailable (enable GEE scan)",
+            "growth": growth_source or (
+                "GEE Sentinel-2 NDWI" if growth is not None else "unavailable (enable GEE scan)"
+            ),
             "population": pop.get("source"),
             "glacier": "reference glacier points (GB)",
             "temperature": temp.get("source"),
@@ -372,82 +432,41 @@ def score_one_lake(
     )
 
 
-@router.get("/monitor")
-@limiter.limit("30/minute")
-def monitor_all_lakes(
-    request: Request,
-    use_gee: bool = Query(
-        False,
-        description="If true, query GEE for growth + population (slow). Default fast hybrid score.",
-    ),
-    limit: int = Query(46, ge=1, le=100),
-    db: Session = Depends(get_db),
-):
-    """
-    Flood monitoring board: score all registered lakes.
-
-    Fast mode (default): area + Open-Meteo elev/temp + glacier heuristic + pop heuristic.
-    GEE mode: also growth rate + WorldPop (slow; needs EE credentials).
-    """
-    lakes: List[LakeModel] = (
-        db.query(LakeModel)
-        .order_by(LakeModel.area_ha.desc())
-        .limit(limit)
-        .all()
-    )
-
-    # One regional temperature for all lakes (avoids 50 Open-Meteo calls)
-    shared_temp = fetch_temperature(35.92, 74.31)
-
-    results = []
-    workers = 8 if not use_gee else 2
-
-    def _job(lake: LakeModel):
-        return assess_lake(
-            lake_id=lake.id,
-            name=lake.name,
+def _failed_lake_row(lake: LakeModel, err: str) -> dict:
+    return {
+        "lake_id": lake.id,
+        "name": lake.name,
+        "latitude": lake.latitude,
+        "longitude": lake.longitude,
+        "area_ha": lake.area_ha,
+        "error": err,
+        "early_warning": classify_level(0),
+        "flood_impact": build_flood_impact(
+            area_ha=lake.area_ha, lat=lake.latitude, lon=lake.longitude
+        ),
+        "flood_prediction": predict_flood_likelihood(
+            early_warning_score=0,
+            early_warning_level="Normal",
+            growth_pct_per_year=None,
+            temperature_c=None,
+            forecast_max_c=None,
+            elevation_m=None,
+            glacier_distance_km=None,
             area_ha=lake.area_ha,
-            lat=lake.latitude,
-            lon=lake.longitude,
-            use_gee=use_gee,
-            include_population=True,
-            shared_temp=shared_temp,
-        )
+        ),
+        "data_sources": {"mode": "error", "error": err},
+    }
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_job, lake): lake for lake in lakes}
-        for fut in as_completed(futs):
-            try:
-                results.append(fut.result())
-            except Exception as e:
-                lake = futs[fut]
-                results.append({
-                    "lake_id": lake.id,
-                    "name": lake.name,
-                    "error": str(e),
-                    "early_warning": classify_level(0),
-                    "flood_impact": build_flood_impact(area_ha=lake.area_ha, lat=lake.latitude, lon=lake.longitude),
-                    "flood_prediction": predict_flood_likelihood(
-                        early_warning_score=0,
-                        early_warning_level="Normal",
-                        growth_pct_per_year=None,
-                        temperature_c=None,
-                        forecast_max_c=None,
-                        elevation_m=None,
-                        glacier_distance_km=None,
-                        area_ha=lake.area_ha,
-                    ),
-                })
 
-    # Sort Critical → Normal, then by score
+def _summarize_monitor(results: list, use_gee: bool, *, offset: int = 0, limit: int = 0, has_more: bool = False) -> dict:
     order = {"Critical": 0, "Warning": 1, "Watch": 2, "Normal": 3}
-    results.sort(
+    results = sorted(
+        results,
         key=lambda r: (
             order.get((r.get("early_warning") or {}).get("level"), 9),
             -float((r.get("early_warning") or {}).get("score") or 0),
-        )
+        ),
     )
-
     counts = {"Critical": 0, "Warning": 0, "Watch": 0, "Normal": 0}
     for r in results:
         lvl = (r.get("early_warning") or {}).get("level")
@@ -468,7 +487,128 @@ def monitor_all_lakes(
         "gee": gee_status(),
         "lakes": results,
         "basins": basin_summary_for_lakes(results),
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+        "chunked": offset > 0 or has_more,
     }
+
+
+@router.get("/monitor")
+@limiter.limit("60/minute")
+def monitor_all_lakes(
+    request: Request,
+    use_gee: bool = Query(
+        False,
+        description="If true, query GEE for growth + population (slow). Default fast hybrid score.",
+    ),
+    limit: int = Query(
+        46,
+        ge=1,
+        le=100,
+        description="Max lakes in this response. For GEE on Render, client should request small chunks (1–3).",
+    ),
+    offset: int = Query(
+        0,
+        ge=0,
+        le=500,
+        description="Skip first N lakes (largest first). Use with small limit for Render-safe GEE scans.",
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    Flood monitoring board: score registered lakes.
+
+    Fast mode (default): area + Open-Meteo elev/temp + glacier heuristic + pop heuristic.
+    GEE mode: 2-year growth + WorldPop (needs EE credentials).
+
+    Render free tier kills HTTP requests ~30s — clients must call this endpoint in
+    small chunks when use_gee=true (offset/limit), not one giant request.
+    """
+    # Cap GEE chunk size server-side so a misconfigured client cannot time out the dyno.
+    if use_gee:
+        max_gee_chunk = int(os.getenv("EW_GEE_CHUNK_MAX", "3" if _is_render() else "8"))
+        if limit > max_gee_chunk:
+            limit = max_gee_chunk
+
+    q = db.query(LakeModel).order_by(LakeModel.area_ha.desc())
+    total_inventory = q.count()
+    lakes: List[LakeModel] = q.offset(offset).limit(limit).all()
+    has_more = (offset + len(lakes)) < total_inventory
+
+    # One regional temperature for all lakes (avoids 50 Open-Meteo calls)
+    shared_temp = fetch_temperature(35.92, 74.31)
+
+    results = []
+    # GEE: sequential or tiny pool — parallel getInfo often worsens latency/rate-limits on free hosts.
+    workers = 6 if not use_gee else 1
+
+    # Hard wall-clock budget so Render proxy does not 502 the whole request.
+    # Leave headroom under ~30s free / ~100s paid.
+    default_budget = 22.0 if (_is_render() and use_gee) else (85.0 if use_gee else 60.0)
+    budget_sec = float(os.getenv("EW_GEE_REQUEST_BUDGET_SEC", str(default_budget)))
+    deadline = time.monotonic() + budget_sec
+
+    def _job(lake: LakeModel, force_fast: bool = False):
+        return assess_lake(
+            lake_id=lake.id,
+            name=lake.name,
+            area_ha=lake.area_ha,
+            lat=lake.latitude,
+            lon=lake.longitude,
+            use_gee=use_gee and not force_fast,
+            include_population=True,
+            shared_temp=shared_temp,
+        )
+
+    if not use_gee:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_job, lake): lake for lake in lakes}
+            for fut in as_completed(futs):
+                lake = futs[fut]
+                try:
+                    results.append(fut.result())
+                except Exception as e:
+                    results.append(_failed_lake_row(lake, str(e)))
+    else:
+        # Sequential GEE with deadline: remaining lakes scored in fast mode so the
+        # chunk always returns before the platform proxy timeout.
+        for lake in lakes:
+            remaining = deadline - time.monotonic()
+            force_fast = remaining < 6.0  # need ~few seconds for one GEE lake
+            try:
+                if force_fast:
+                    row = _job(lake, force_fast=True)
+                    ds = row.setdefault("data_sources", {})
+                    ds["mode"] = "fast_fallback"
+                    ds["note"] = "Scored without GEE to beat host request timeout; retry chunk or wait for cache."
+                    results.append(row)
+                else:
+                    # Per-lake timeout so one stuck getInfo cannot kill the chunk
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        fut = pool.submit(_job, lake, False)
+                        try:
+                            results.append(fut.result(timeout=max(5.0, min(remaining - 2.0, 28.0))))
+                        except FuturesTimeout:
+                            row = _job(lake, force_fast=True)
+                            ds = row.setdefault("data_sources", {})
+                            ds["mode"] = "fast_fallback"
+                            ds["note"] = "GEE lake timed out; used fast fallback."
+                            results.append(row)
+            except Exception as e:
+                results.append(_failed_lake_row(lake, str(e)))
+
+    payload = _summarize_monitor(
+        results,
+        use_gee,
+        offset=offset,
+        limit=limit,
+        has_more=has_more,
+    )
+    payload["inventory_total"] = total_inventory
+    payload["next_offset"] = offset + len(lakes) if has_more else None
+    payload["request_budget_sec"] = budget_sec
+    return payload
 
 
 @router.get("/basins")

@@ -28,6 +28,37 @@ import {
 import { API_BASE } from './api';
 import './App.css';
 
+/** Merge chunked /early-warning/monitor responses (GEE Render-safe scans). */
+function mergeEwChunks(lakes, lastMeta, partial = false) {
+  const counts = { Critical: 0, Warning: 0, Watch: 0, Normal: 0 };
+  const prediction_counts = { High: 0, Likely: 0, Possible: 0, Unlikely: 0 };
+  const order = { Critical: 0, Warning: 1, Watch: 2, Normal: 3 };
+  const sorted = [...(lakes || [])].sort((a, b) => {
+    const la = a?.early_warning?.level || 'Normal';
+    const lb = b?.early_warning?.level || 'Normal';
+    const d = (order[la] ?? 9) - (order[lb] ?? 9);
+    if (d !== 0) return d;
+    return (b?.early_warning?.score || 0) - (a?.early_warning?.score || 0);
+  });
+  for (const r of sorted) {
+    const lvl = r?.early_warning?.level;
+    if (lvl in counts) counts[lvl] += 1;
+    const pl = r?.flood_prediction?.likelihood;
+    if (pl in prediction_counts) prediction_counts[pl] += 1;
+  }
+  return {
+    ...(lastMeta || {}),
+    total: sorted.length,
+    counts,
+    prediction_counts,
+    lakes: sorted,
+    basins: lastMeta?.basins,
+    use_gee: true,
+    partial,
+    chunked: true,
+  };
+}
+
 const ThemeContext = createContext();
 
 function ThemeProvider({ children }) {
@@ -112,6 +143,7 @@ function AppContent() {
   // Flood Monitoring / Early Warning
   const [ewData, setEwData] = useState(null);
   const [ewLoading, setEwLoading] = useState(false);
+  const [ewProgress, setEwProgress] = useState(null); // { done, total, label } for GEE chunks
   const [ewUseGee, setEwUseGee] = useState(false);
   const [ewFilter, setEwFilter] = useState('All');
   const [ewSelected, setEwSelected] = useState(null);
@@ -571,29 +603,95 @@ function AppContent() {
   const fetchEarlyWarningBoard = async (useGee = ewUseGee) => {
     setEwLoading(true);
     setEwSelected(null);
+    setEwProgress(null);
+    let partialLakes = [];
     try {
-      // Fast path default — avoid GEE timeouts; boolean must be string for some proxies
-      const res = await axios.get(`${API_BASE}/early-warning/monitor`, {
-        params: { use_gee: useGee ? 'true' : 'false', limit: 46 },
-        timeout: useGee ? 300000 : 90000,
-      });
-      if (!res.data?.lakes) {
-        throw new Error('Invalid response from early-warning API');
+      // Fast path: one request. GEE path: small chunks so Render free (~30s HTTP
+      // limit) does not 502 — each chunk scores a few lakes, then we merge.
+      if (!useGee) {
+        const res = await axios.get(`${API_BASE}/early-warning/monitor`, {
+          params: { use_gee: 'false', limit: 46, offset: 0 },
+          timeout: 90000,
+        });
+        if (!res.data?.lakes) throw new Error('Invalid response from early-warning API');
+        setEwData(res.data);
+        return;
       }
-      setEwData(res.data);
+
+      const TARGET = 46;
+      // 1 lake/chunk: Render free HTTP limit is ~30s. Each lake needs ~2 GEE
+      // getInfo calls (growth + WorldPop); larger chunks often 502 on free tier.
+      const CHUNK = 1;
+      let offset = 0;
+      let allLakes = [];
+      let lastMeta = null;
+      let inventoryTotal = TARGET;
+
+      while (offset < TARGET) {
+        const totalShown = Math.min(TARGET, inventoryTotal || TARGET);
+        setEwProgress({
+          done: allLakes.length,
+          total: totalShown,
+          label: `GEE scan ${allLakes.length}/${totalShown} lakes (chunked for Render)…`,
+        });
+        // Progressive board so the UI is not blank for minutes
+        if (allLakes.length) {
+          partialLakes = allLakes;
+          setEwData(mergeEwChunks(allLakes, lastMeta, true));
+        }
+
+        const res = await axios.get(`${API_BASE}/early-warning/monitor`, {
+          params: {
+            use_gee: 'true',
+            limit: CHUNK,
+            offset,
+          },
+          // Per-chunk timeout — backend also enforces a wall-clock budget
+          timeout: 90000,
+        });
+        if (!res.data?.lakes) throw new Error('Invalid response from early-warning API');
+
+        lastMeta = res.data;
+        if (typeof res.data.inventory_total === 'number') {
+          inventoryTotal = res.data.inventory_total;
+        }
+        allLakes = allLakes.concat(res.data.lakes || []);
+        partialLakes = allLakes;
+
+        const next = res.data.next_offset;
+        if (next == null || next <= offset || !res.data.has_more) break;
+        if (allLakes.length >= TARGET) break;
+        offset = next;
+      }
+
+      setEwData(mergeEwChunks(allLakes.slice(0, TARGET), lastMeta, false));
+      setEwProgress(null);
     } catch (err) {
       console.error('Flood monitoring scan failed', err);
       const status = err?.response?.status;
       const detail = err?.response?.data?.detail || err.message || 'Failed to load early warning scores';
+      const isTimeout =
+        err?.code === 'ECONNABORTED' ||
+        /timeout/i.test(String(detail)) ||
+        status === 502 ||
+        status === 504;
       const msg = status === 404
         ? 'Early-warning API not found. Restart the backend (uvicorn) so /early-warning routes are loaded.'
         : status === 429
           ? 'Rate limited — wait a minute and try again.'
-          : (typeof detail === 'string' ? detail : JSON.stringify(detail));
-      alert(`Flood Monitoring failed: ${msg}`);
-      setEwData(null);
+          : isTimeout
+            ? 'Host timed out mid-scan (common on Render free). Partial results are kept when available; re-run to fill cache.'
+            : (typeof detail === 'string' ? detail : JSON.stringify(detail));
+      if (partialLakes.length) {
+        setEwData(mergeEwChunks(partialLakes, null, true));
+        alert(`Flood Monitoring interrupted: ${msg}`);
+      } else {
+        alert(`Flood Monitoring failed: ${msg}`);
+        setEwData(null);
+      }
     } finally {
       setEwLoading(false);
+      setEwProgress(null);
     }
   };
 
@@ -1694,11 +1792,17 @@ function AppContent() {
             return (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
                 <div style={{ ...cardStyle, padding: 24 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' }}>
-                    <div>
+                  <div style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'flex-start',
+                    gap: 16,
+                    flexWrap: 'wrap',
+                  }}>
+                    <div style={{ flex: '1 1 280px', minWidth: 0, maxWidth: 720 }}>
                       <div style={eyebrow}>GLOF Early Warning Score</div>
                       <h3 style={{ ...sectionTitle, marginBottom: 8 }}>Flood Monitoring Board</h3>
-                      <p style={{ margin: 0, color: pal.mid, fontSize: 13.5, maxWidth: 720, lineHeight: 1.55 }}>
+                      <p style={{ margin: 0, color: pal.mid, fontSize: 13.5, lineHeight: 1.55 }}>
                         Composite score from <strong>lake area</strong>, <strong>3–5 year growth</strong>,{' '}
                         <strong>elevation</strong>, <strong>glacier proximity</strong>, and{' '}
                         <strong>downstream population</strong>. Lakes are classed as{' '}
@@ -1708,29 +1812,63 @@ function AppContent() {
                         <span style={{ color: '#f0433a', fontWeight: 700 }}>Critical</span>.
                       </p>
                     </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, alignItems: 'flex-end' }}>
-                      <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: pal.mid, cursor: 'pointer' }}>
+                    {/* Controls pinned top-right (original Flood Monitoring placement) */}
+                    <div style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 10,
+                      alignItems: 'flex-end',
+                      flex: '0 0 auto',
+                      marginLeft: 'auto',
+                    }}>
+                      <label style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        fontSize: 13,
+                        color: pal.mid,
+                        cursor: 'pointer',
+                        whiteSpace: 'nowrap',
+                      }}>
                         <input
                           type="checkbox"
                           checked={ewUseGee}
                           onChange={(e) => setEwUseGee(e.target.checked)}
+                          disabled={ewLoading}
                         />
                         Include GEE growth + population (slower)
                       </label>
                       <motion.button
                         className="btn-3d"
-                        whileHover={{ scale: 1.03 }}
-                        whileTap={{ scale: 0.97 }}
+                        whileHover={{ scale: ewLoading ? 1 : 1.03 }}
+                        whileTap={{ scale: ewLoading ? 1 : 0.97 }}
                         disabled={ewLoading}
                         onClick={() => fetchEarlyWarningBoard(ewUseGee)}
                         style={{
-                          padding: '11px 18px', borderRadius: 12, border: 'none',
+                          padding: '11px 18px',
+                          borderRadius: 12,
+                          border: 'none',
                           background: ewLoading ? '#94a3b8' : 'linear-gradient(135deg,#5eead4,#38bdf8)',
-                          color: '#06131a', fontWeight: 800, fontSize: 13, cursor: 'pointer'
+                          color: '#06131a',
+                          fontWeight: 800,
+                          fontSize: 13,
+                          cursor: ewLoading ? 'wait' : 'pointer',
+                          whiteSpace: 'nowrap',
                         }}
                       >
                         {ewLoading ? 'Scoring lakes…' : 'Run Early Warning Scan'}
                       </motion.button>
+                      {ewProgress && (
+                        <div style={{
+                          fontSize: 11.5,
+                          color: pal.accent,
+                          fontFamily: 'var(--font-mono)',
+                          textAlign: 'right',
+                          maxWidth: 220,
+                        }}>
+                          {ewProgress.done}/{ewProgress.total} lakes
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -1762,18 +1900,34 @@ function AppContent() {
                     Click <strong style={{ color: pal.accent }}>Run Early Warning Scan</strong> to score all registered lakes.
                     <div style={{ marginTop: 10, fontSize: 12.5 }}>
                       Fast mode always includes elevation, glacier proximity, temperature, flood impact & prediction.
-                      Enable GEE for satellite growth + WorldPop population.
+                      Enable GEE for satellite growth + WorldPop (scanned in small chunks so Render does not time out).
                     </div>
                   </div>
                 )}
 
-                {ewLoading && (
+                {ewLoading && !ewData?.lakes?.length && (
                   <div style={{ ...cardStyle, padding: 48, textAlign: 'center', color: pal.mid }}>
                     Computing Early Warning Scores{ewUseGee ? ' with GEE (may take several minutes)…' : '…'}
+                    {ewProgress && (
+                      <div style={{ marginTop: 14, fontSize: 13, color: pal.accent, fontFamily: 'var(--font-mono)' }}>
+                        {ewProgress.label || `${ewProgress.done}/${ewProgress.total}`}
+                        <div style={{
+                          margin: '12px auto 0', maxWidth: 280, height: 6, borderRadius: 99,
+                          background: 'rgba(148,163,184,0.25)', overflow: 'hidden',
+                        }}>
+                          <div style={{
+                            height: '100%',
+                            width: `${Math.min(100, (100 * (ewProgress.done || 0)) / Math.max(1, ewProgress.total || 1))}%`,
+                            background: 'linear-gradient(90deg,#5eead4,#38bdf8)',
+                            transition: 'width 0.35s ease',
+                          }} />
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
-                {ewData && !ewLoading && (() => {
+                {ewData && (!ewLoading || ewData.partial) && (() => {
                   const PRED_COLOR = { High: '#f0433a', Likely: '#f5a524', Possible: '#38bdf8', Unlikely: '#2dd48e' };
                   const predCounts = ewData.prediction_counts || {};
                   const impact = selected?.flood_impact;

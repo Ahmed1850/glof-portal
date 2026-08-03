@@ -257,6 +257,10 @@ def estimate_population(lat: float, lon: float, radius_km: float = 5.0) -> dict:
 
 @_require_ee
 def estimate_lake_exposure(lat: float, lon: float, risk_level: str = "High") -> dict:
+    """
+    Danger + warning population in a single GEE getInfo() call.
+    (Previously 2 sequential WorldPop reduceRegions — too slow for Render.)
+    """
     if risk_level == "High":
         danger_km, warning_km = 5.0, 10.0
     elif risk_level == "Medium":
@@ -264,17 +268,161 @@ def estimate_lake_exposure(lat: float, lon: float, risk_level: str = "High") -> 
     else:
         danger_km, warning_km = 1.0, 2.0
 
-    danger = estimate_population(lat, lon, danger_km)
-    warning = estimate_population(lat, lon, warning_km)
+    if lat is None or lon is None:
+        return {
+            "danger_zone_km": danger_km,
+            "warning_zone_km": warning_km,
+            "danger_population": 0,
+            "warning_population": 0,
+            "source": "WorldPop via GEE",
+            "risk_level": risk_level,
+            "error": "Missing coordinates",
+        }
 
-    return {
-        "danger_zone_km": danger_km,
-        "warning_zone_km": warning_km,
-        "danger_population": danger.get("population", 0),
-        "warning_population": warning.get("population", 0),
-        "source": "WorldPop via GEE",
-        "risk_level": risk_level
-    }
+    try:
+        point = ee.Geometry.Point([lon, lat])
+        danger_geom = point.buffer(danger_km * 1000)
+        warning_geom = point.buffer(warning_km * 1000)
+
+        pop = (ee.ImageCollection("WorldPop/GP/100m/pop")
+               .filter(ee.Filter.eq("country", "PAK"))
+               .sort("year", False)
+               .first())
+
+        band = pop.bandNames().get(0)
+        pop_img = pop.select([band], ["population"])
+
+        danger_sum = pop_img.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=danger_geom,
+            scale=100,
+            maxPixels=1e8,
+            bestEffort=True,
+        ).get("population")
+        warning_sum = pop_img.reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=warning_geom,
+            scale=100,
+            maxPixels=1e8,
+            bestEffort=True,
+        ).get("population")
+
+        stats = ee.Dictionary({
+            "danger": danger_sum,
+            "warning": warning_sum,
+        }).getInfo()
+
+        def _as_int(v):
+            if v is None:
+                return 0
+            try:
+                return int(round(float(v)))
+            except (TypeError, ValueError):
+                return 0
+
+        danger_pop = _as_int(stats.get("danger") if stats else None)
+        warning_pop = _as_int(stats.get("warning") if stats else None)
+
+        return {
+            "danger_zone_km": danger_km,
+            "warning_zone_km": warning_km,
+            "danger_population": danger_pop,
+            "warning_population": max(warning_pop, danger_pop),
+            "source": "WorldPop via GEE",
+            "risk_level": risk_level,
+        }
+    except Exception as e:
+        return {
+            "danger_zone_km": danger_km,
+            "warning_zone_km": warning_km,
+            "danger_population": 0,
+            "warning_population": 0,
+            "source": "WorldPop via GEE",
+            "risk_level": risk_level,
+            "error": str(e),
+        }
+
+
+@_require_ee
+def estimate_growth_pct_per_year(
+    lat: float,
+    lon: float,
+    year_start: int = 2019,
+    year_end: int = 2024,
+    buffer_m: float = 1200,
+) -> dict:
+    """
+    Fast growth rate for early-warning: two summer seasons in ONE getInfo().
+
+    Full 11-year historical series is still available via get_historical_areas()
+    for the Historical tab — this is only for board scoring under Render timeouts.
+    """
+    if lat is None or lon is None:
+        return {"growth_pct_per_year": None, "error": "Missing coordinates"}
+
+    try:
+        point = ee.Geometry.Point([lon, lat])
+        region = point.buffer(buffer_m)
+
+        def _summer_water_area_m2(year: int):
+            start = f"{year}-07-01"
+            end = f"{year}-09-30"
+            s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                  .filterBounds(region)
+                  .filterDate(start, end)
+                  .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 40))
+                  .median())
+            ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI")
+            water = ndwi.gt(0.2).selfMask()
+            return water.multiply(ee.Image.pixelArea()).reduceRegion(
+                reducer=ee.Reducer.sum(),
+                geometry=region,
+                scale=30,  # slightly coarser than 20m → much faster on free hosts
+                maxPixels=1e7,
+                bestEffort=True,
+            ).get("NDWI")
+
+        stats = ee.Dictionary({
+            "a0": _summer_water_area_m2(year_start),
+            "a1": _summer_water_area_m2(year_end),
+            "y0": year_start,
+            "y1": year_end,
+        }).getInfo()
+
+        a0_m2 = stats.get("a0")
+        a1_m2 = stats.get("a1")
+        if a0_m2 is None and a1_m2 is None:
+            return {
+                "growth_pct_per_year": None,
+                "year_start": year_start,
+                "year_end": year_end,
+                "error": "No water area for either year",
+            }
+
+        a0 = float(a0_m2 or 0.0) / 10000.0
+        a1 = float(a1_m2 or 0.0) / 10000.0
+        span = max(1, int(year_end) - int(year_start))
+
+        if a0 <= 0:
+            growth = 50.0 if a1 > 0 else 0.0
+        else:
+            growth = ((a1 - a0) / a0) * 100.0 / span
+
+        return {
+            "growth_pct_per_year": round(float(growth), 2),
+            "area_start_ha": round(a0, 2),
+            "area_end_ha": round(a1, 2),
+            "year_start": year_start,
+            "year_end": year_end,
+            "source": "GEE Sentinel-2 NDWI (2-year fast growth)",
+        }
+    except Exception as e:
+        return {
+            "growth_pct_per_year": None,
+            "year_start": year_start,
+            "year_end": year_end,
+            "error": str(e),
+        }
 
 
 # ==================== HISTORICAL AREA (Sentinel-2 NDWI) ====================
