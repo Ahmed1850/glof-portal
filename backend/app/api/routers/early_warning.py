@@ -4,23 +4,26 @@ GLOF Early Warning / Flood Monitoring API
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
 import threading
 import time
+import traceback
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.models.lake import Lake as LakeModel
 from app.services.early_warning import compute_early_warning, classify_level
 from app.services.flood_impact import build_flood_impact, predict_flood_likelihood, fetch_temperature
@@ -39,6 +42,12 @@ _CACHE_LOCK = threading.Lock()
 _GROWTH_CACHE: dict[str, tuple[float, Optional[float]]] = {}
 _POP_CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL_SEC = float(os.getenv("EW_GEE_CACHE_TTL_SEC", str(6 * 3600)))  # 6h
+
+# Background monitor jobs (bypass Render HTTP proxy timeout on long GEE scans)
+_JOBS_LOCK = threading.Lock()
+_JOBS: dict[str, dict[str, Any]] = {}
+_JOB_TTL_SEC = 2 * 3600
+_ACTIVE_JOB_ID: Optional[str] = None
 
 
 def _cache_key(lat: float, lon: float, *parts) -> str:
@@ -94,7 +103,7 @@ def nearest_glacier_km(lat: float, lon: float) -> float:
     return min(_haversine_km(lat, lon, glat, glon) for glat, glon in GLACIER_REFS)
 
 
-def _http_get_json(url: str, timeout: float = 20.0) -> dict:
+def _http_get_json(url: str, timeout: float = 8.0) -> dict:
     """Stdlib GET — more reliable on free hosts than httpx in some environments."""
     req = urllib.request.Request(
         url,
@@ -109,7 +118,7 @@ def fetch_elevation_open_meteo(lat: float, lon: float) -> Optional[float]:
     """Open-Meteo elevation API (no key)."""
     try:
         qs = urllib.parse.urlencode({"latitude": lat, "longitude": lon})
-        data = _http_get_json(f"https://api.open-meteo.com/v1/elevation?{qs}")
+        data = _http_get_json(f"https://api.open-meteo.com/v1/elevation?{qs}", timeout=6.0)
         elev = data.get("elevation")
         if isinstance(elev, list) and elev:
             return float(elev[0])
@@ -124,7 +133,7 @@ def fetch_elevation_open_elevation(lat: float, lon: float) -> Optional[float]:
     """Public Open-Elevation fallback."""
     try:
         qs = urllib.parse.urlencode({"locations": f"{lat},{lon}"})
-        data = _http_get_json(f"https://api.open-elevation.com/api/v1/lookup?{qs}")
+        data = _http_get_json(f"https://api.open-elevation.com/api/v1/lookup?{qs}", timeout=6.0)
         results = data.get("results") or []
         if results and results[0].get("elevation") is not None:
             return float(results[0]["elevation"])
@@ -298,8 +307,13 @@ def assess_lake(
     growth = None
     growth_source = None
     if use_gee:
-        # Elevation stays on Open-Meteo first (fast). GEE used only for growth + WorldPop.
-        elevation_m, elevation_source = fetch_elevation_m(lat, lon)
+        # Elevation: Open-Meteo only (never fall through to GEE SRTM — that adds
+        # another slow getInfo on the same critical path as growth/pop).
+        elevation_m = fetch_elevation_open_meteo(lat, lon)
+        elevation_source = "Open-Meteo" if elevation_m is not None else None
+        if elevation_m is None:
+            elevation_m = fetch_elevation_open_elevation(lat, lon)
+            elevation_source = "Open-Elevation" if elevation_m is not None else None
         try:
             growth = fetch_growth_from_gee(lat, lon)
             growth_source = "GEE Sentinel-2 NDWI (2-year fast)" if growth is not None else "GEE growth unavailable"
@@ -609,6 +623,231 @@ def monitor_all_lakes(
     payload["next_offset"] = offset + len(lakes) if has_more else None
     payload["request_budget_sec"] = budget_sec
     return payload
+
+
+def _prune_jobs() -> None:
+    now = time.time()
+    with _JOBS_LOCK:
+        dead = [jid for jid, j in _JOBS.items() if now - float(j.get("created_at") or 0) > _JOB_TTL_SEC]
+        for jid in dead:
+            _JOBS.pop(jid, None)
+
+
+def _snapshot_job(job: dict) -> dict:
+    """Thread-safe shallow copy for API responses (result cloned)."""
+    with _JOBS_LOCK:
+        snap = {
+            "job_id": job.get("job_id"),
+            "status": job.get("status"),
+            "use_gee": job.get("use_gee"),
+            "done": int(job.get("done") or 0),
+            "total": int(job.get("total") or 0),
+            "current_lake": job.get("current_lake"),
+            "error": job.get("error"),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
+            "finished_at": job.get("finished_at"),
+            "partial": job.get("status") == "running",
+            "lakes": list(job.get("lakes") or []),
+            "result": copy.deepcopy(job.get("result")) if job.get("result") is not None else None,
+        }
+    snap["gee"] = gee_status()
+    return snap
+
+
+def _run_monitor_job(job_id: str, lake_rows: list[dict], use_gee: bool) -> None:
+    """Score lakes in a background thread — not bound by Render HTTP proxy timeout."""
+    global _ACTIVE_JOB_ID
+    shared_temp = fetch_temperature(35.92, 74.31)
+    results: list = []
+    try:
+        for i, row in enumerate(lake_rows):
+            with _JOBS_LOCK:
+                job = _JOBS.get(job_id)
+                if not job or job.get("cancel"):
+                    return
+                job["current_lake"] = row.get("name")
+                job["updated_at"] = time.time()
+
+            try:
+                assessed = assess_lake(
+                    lake_id=row.get("id"),
+                    name=row.get("name") or "Lake",
+                    area_ha=row.get("area_ha"),
+                    lat=row.get("latitude"),
+                    lon=row.get("longitude"),
+                    use_gee=use_gee,
+                    include_population=True,
+                    shared_temp=shared_temp,
+                )
+            except Exception as e:
+                # Build a minimal failed row without ORM
+                assessed = {
+                    "lake_id": row.get("id"),
+                    "name": row.get("name"),
+                    "latitude": row.get("latitude"),
+                    "longitude": row.get("longitude"),
+                    "area_ha": row.get("area_ha"),
+                    "error": str(e),
+                    "early_warning": classify_level(0),
+                    "flood_impact": build_flood_impact(
+                        area_ha=row.get("area_ha"),
+                        lat=row.get("latitude"),
+                        lon=row.get("longitude"),
+                    ),
+                    "flood_prediction": predict_flood_likelihood(
+                        early_warning_score=0,
+                        early_warning_level="Normal",
+                        growth_pct_per_year=None,
+                        temperature_c=None,
+                        forecast_max_c=None,
+                        elevation_m=None,
+                        glacier_distance_km=None,
+                        area_ha=row.get("area_ha"),
+                    ),
+                    "data_sources": {"mode": "error", "error": str(e)},
+                }
+
+            results.append(assessed)
+            partial = _summarize_monitor(results, use_gee, offset=0, limit=len(results), has_more=True)
+            partial["inventory_total"] = len(lake_rows)
+            partial["job_id"] = job_id
+            partial["partial"] = True
+
+            with _JOBS_LOCK:
+                job = _JOBS.get(job_id)
+                if not job:
+                    return
+                job["done"] = i + 1
+                job["lakes"] = list(results)
+                job["result"] = partial
+                job["updated_at"] = time.time()
+
+        final = _summarize_monitor(results, use_gee, offset=0, limit=len(results), has_more=False)
+        final["inventory_total"] = len(lake_rows)
+        final["job_id"] = job_id
+        final["partial"] = False
+        final["next_offset"] = None
+
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job["status"] = "done"
+                job["done"] = len(results)
+                job["lakes"] = list(results)
+                job["result"] = final
+                job["current_lake"] = None
+                job["finished_at"] = time.time()
+                job["updated_at"] = time.time()
+    except Exception as e:
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"] = f"{e}\n{traceback.format_exc()[-500:]}"
+                job["finished_at"] = time.time()
+                job["updated_at"] = time.time()
+                if results:
+                    partial = _summarize_monitor(results, use_gee, offset=0, limit=len(results), has_more=False)
+                    partial["partial"] = True
+                    partial["error"] = str(e)
+                    job["result"] = partial
+                    job["lakes"] = list(results)
+    finally:
+        with _JOBS_LOCK:
+            if _ACTIVE_JOB_ID == job_id:
+                _ACTIVE_JOB_ID = None
+
+
+@router.post("/monitor/jobs")
+@limiter.limit("20/minute")
+def start_monitor_job(
+    request: Request,
+    use_gee: bool = Query(True, description="GEE growth + WorldPop (background job for Render)."),
+    limit: int = Query(46, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """
+    Start a background Flood Monitoring scan.
+
+    Use this on Render instead of a single long /monitor call. Poll
+    GET /early-warning/monitor/jobs/{job_id} until status is done|error.
+    Short polls keep free dynos awake without hitting the ~30s HTTP timeout.
+    """
+    global _ACTIVE_JOB_ID
+    _prune_jobs()
+
+    # Reuse an in-flight job with the same mode instead of stacking GEE work.
+    reuse_id = None
+    with _JOBS_LOCK:
+        if _ACTIVE_JOB_ID and _ACTIVE_JOB_ID in _JOBS:
+            active = _JOBS[_ACTIVE_JOB_ID]
+            if active.get("status") == "running" and bool(active.get("use_gee")) == bool(use_gee):
+                reuse_id = _ACTIVE_JOB_ID
+    if reuse_id:
+        with _JOBS_LOCK:
+            active = _JOBS.get(reuse_id)
+        if active:
+            return _snapshot_job(active)
+
+    lakes: List[LakeModel] = (
+        db.query(LakeModel)
+        .order_by(LakeModel.area_ha.desc())
+        .limit(limit)
+        .all()
+    )
+    lake_rows = [
+        {
+            "id": lake.id,
+            "name": lake.name,
+            "area_ha": lake.area_ha,
+            "latitude": lake.latitude,
+            "longitude": lake.longitude,
+        }
+        for lake in lakes
+    ]
+
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "job_id": job_id,
+        "status": "running",
+        "use_gee": bool(use_gee),
+        "done": 0,
+        "total": len(lake_rows),
+        "current_lake": None,
+        "lakes": [],
+        "result": None,
+        "error": None,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "finished_at": None,
+        "cancel": False,
+    }
+
+    with _JOBS_LOCK:
+        _JOBS[job_id] = job
+        _ACTIVE_JOB_ID = job_id
+
+    t = threading.Thread(
+        target=_run_monitor_job,
+        args=(job_id, lake_rows, bool(use_gee)),
+        name=f"ew-monitor-{job_id}",
+        daemon=True,
+    )
+    t.start()
+    return _snapshot_job(job)
+
+
+@router.get("/monitor/jobs/{job_id}")
+@limiter.limit("120/minute")
+def get_monitor_job(request: Request, job_id: str):
+    """Poll background monitor job (cheap; safe under Render proxy limits)."""
+    _prune_jobs()
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    return _snapshot_job(job)
 
 
 @router.get("/basins")

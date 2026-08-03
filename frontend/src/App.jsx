@@ -605,9 +605,9 @@ function AppContent() {
     setEwSelected(null);
     setEwProgress(null);
     let partialLakes = [];
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     try {
-      // Fast path: one request. GEE path: small chunks so Render free (~30s HTTP
-      // limit) does not 502 — each chunk scores a few lakes, then we merge.
+      // Fast path: single short request (no GEE).
       if (!useGee) {
         const res = await axios.get(`${API_BASE}/early-warning/monitor`, {
           params: { use_gee: 'false', limit: 46, offset: 0 },
@@ -618,54 +618,89 @@ function AppContent() {
         return;
       }
 
-      const TARGET = 46;
-      // 1 lake/chunk: Render free HTTP limit is ~30s. Each lake needs ~2 GEE
-      // getInfo calls (growth + WorldPop); larger chunks often 502 on free tier.
-      const CHUNK = 1;
-      let offset = 0;
-      let allLakes = [];
-      let lastMeta = null;
-      let inventoryTotal = TARGET;
-
-      while (offset < TARGET) {
-        const totalShown = Math.min(TARGET, inventoryTotal || TARGET);
-        setEwProgress({
-          done: allLakes.length,
-          total: totalShown,
-          label: `GEE scan ${allLakes.length}/${totalShown} lakes (chunked for Render)…`,
-        });
-        // Progressive board so the UI is not blank for minutes
-        if (allLakes.length) {
-          partialLakes = allLakes;
-          setEwData(mergeEwChunks(allLakes, lastMeta, true));
+      // GEE path: background job + short polls.
+      // Render free kills HTTP requests ~30s — a single /monitor?use_gee=true for
+      // all lakes always glitches. Job work runs server-side without that limit.
+      let start;
+      try {
+        start = await axios.post(
+          `${API_BASE}/early-warning/monitor/jobs`,
+          null,
+          { params: { use_gee: 'true', limit: 46 }, timeout: 30000 },
+        );
+      } catch (startErr) {
+        // Older deploy without jobs API — fall back to one small sync chunk only
+        if (startErr?.response?.status === 404 || startErr?.response?.status === 405) {
+          const res = await axios.get(`${API_BASE}/early-warning/monitor`, {
+            params: { use_gee: 'true', limit: 1, offset: 0 },
+            timeout: 90000,
+          });
+          if (!res.data?.lakes) throw startErr;
+          setEwData({ ...res.data, partial: true, note: 'Legacy host: upgrade deploy for full GEE board job.' });
+          return;
         }
-
-        const res = await axios.get(`${API_BASE}/early-warning/monitor`, {
-          params: {
-            use_gee: 'true',
-            limit: CHUNK,
-            offset,
-          },
-          // Per-chunk timeout — backend also enforces a wall-clock budget
-          timeout: 90000,
-        });
-        if (!res.data?.lakes) throw new Error('Invalid response from early-warning API');
-
-        lastMeta = res.data;
-        if (typeof res.data.inventory_total === 'number') {
-          inventoryTotal = res.data.inventory_total;
-        }
-        allLakes = allLakes.concat(res.data.lakes || []);
-        partialLakes = allLakes;
-
-        const next = res.data.next_offset;
-        if (next == null || next <= offset || !res.data.has_more) break;
-        if (allLakes.length >= TARGET) break;
-        offset = next;
+        throw startErr;
       }
 
-      setEwData(mergeEwChunks(allLakes.slice(0, TARGET), lastMeta, false));
-      setEwProgress(null);
+      const jobId = start.data?.job_id;
+      if (!jobId) throw new Error('Monitor job did not return job_id');
+
+      const totalHint = start.data?.total || 46;
+      setEwProgress({
+        done: start.data?.done || 0,
+        total: totalHint,
+        label: `GEE job started (0/${totalHint})…`,
+      });
+
+      // Poll until done. Keep polls short so the free dyno stays awake and never
+      // hits the long-request proxy timeout.
+      const maxPolls = 600; // ~20 min at 2s
+      for (let i = 0; i < maxPolls; i++) {
+        await sleep(i === 0 ? 800 : 2000);
+        const st = await axios.get(`${API_BASE}/early-warning/monitor/jobs/${jobId}`, {
+          timeout: 20000,
+        });
+        const snap = st.data || {};
+        const done = snap.done || 0;
+        const total = snap.total || totalHint;
+        const cur = snap.current_lake ? ` · ${snap.current_lake}` : '';
+        setEwProgress({
+          done,
+          total,
+          label: `GEE scan ${done}/${total}${cur}`,
+        });
+
+        const board =
+          snap.result ||
+          (snap.lakes?.length
+            ? mergeEwChunks(snap.lakes, { use_gee: true, gee: snap.gee }, snap.status === 'running')
+            : null);
+        if (board?.lakes?.length) {
+          partialLakes = board.lakes;
+          setEwData({
+            ...board,
+            partial: snap.status === 'running',
+            job_id: jobId,
+          });
+        }
+
+        if (snap.status === 'done') {
+          if (snap.result?.lakes) {
+            setEwData({ ...snap.result, partial: false, job_id: jobId });
+          } else if (snap.lakes?.length) {
+            setEwData(mergeEwChunks(snap.lakes, snap.result, false));
+          }
+          setEwProgress(null);
+          return;
+        }
+        if (snap.status === 'error') {
+          if (partialLakes.length) {
+            setEwData(mergeEwChunks(partialLakes, snap.result, true));
+          }
+          throw new Error(snap.error || 'GEE monitor job failed');
+        }
+      }
+      throw new Error('GEE scan timed out waiting for background job');
     } catch (err) {
       console.error('Flood monitoring scan failed', err);
       const status = err?.response?.status;
@@ -676,15 +711,16 @@ function AppContent() {
         status === 502 ||
         status === 504;
       const msg = status === 404
-        ? 'Early-warning API not found. Restart the backend (uvicorn) so /early-warning routes are loaded.'
+        ? 'Early-warning API not found. Wait for Render deploy to finish, then hard-refresh.'
         : status === 429
           ? 'Rate limited — wait a minute and try again.'
           : isTimeout
-            ? 'Host timed out mid-scan (common on Render free). Partial results are kept when available; re-run to fill cache.'
+            ? 'Host glitched mid-scan. Partial results kept when available — click Run again (cached lakes finish faster).'
             : (typeof detail === 'string' ? detail : JSON.stringify(detail));
       if (partialLakes.length) {
         setEwData(mergeEwChunks(partialLakes, null, true));
-        alert(`Flood Monitoring interrupted: ${msg}`);
+        // Soft notice only when we already have usable partial board
+        console.warn('Flood Monitoring interrupted:', msg);
       } else {
         alert(`Flood Monitoring failed: ${msg}`);
         setEwData(null);
@@ -1907,7 +1943,8 @@ function AppContent() {
 
                 {ewLoading && !ewData?.lakes?.length && (
                   <div style={{ ...cardStyle, padding: 48, textAlign: 'center', color: pal.mid }}>
-                    Computing Early Warning Scores{ewUseGee ? ' with GEE (may take several minutes)…' : '…'}
+                    Computing Early Warning Scores
+                    {ewUseGee ? ' with GEE (background job — safe on Render)…' : '…'}
                     {ewProgress && (
                       <div style={{ marginTop: 14, fontSize: 13, color: pal.accent, fontFamily: 'var(--font-mono)' }}>
                         {ewProgress.label || `${ewProgress.done}/${ewProgress.total}`}
