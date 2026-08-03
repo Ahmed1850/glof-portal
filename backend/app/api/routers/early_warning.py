@@ -213,7 +213,14 @@ def assess_lake(
     lon: Optional[float],
     use_gee: bool = True,
     include_population: bool = True,
+    shared_temp: Optional[dict] = None,
 ) -> dict:
+    """
+    Score one lake.
+
+    Fast path (use_gee=False): no GEE calls — Open-Meteo elev/temp + heuristic pop.
+    Slow path (use_gee=True): growth + WorldPop via GEE (can take minutes for many lakes).
+    """
     if lat is None or lon is None:
         result = compute_early_warning(area_ha=area_ha, include_glacier=False)
         impact = build_flood_impact(area_ha=area_ha, lat=None, lon=None)
@@ -238,19 +245,31 @@ def assess_lake(
             "data_sources": {"note": "Missing coordinates — area-only score"},
         }
 
-    elevation_m, elevation_source = fetch_elevation_m(lat, lon)
     glacier_km = round(nearest_glacier_km(lat, lon), 2)
-    temp = fetch_temperature(lat, lon)
+    temp = shared_temp if shared_temp is not None else fetch_temperature(lat, lon)
 
     growth = None
     if use_gee:
+        # Full multi-source elevation + GEE growth + population
+        elevation_m, elevation_source = fetch_elevation_m(lat, lon)
         growth = fetch_growth_from_gee(lat, lon)
-    # Population always estimated (GEE WorldPop when possible, else heuristic)
-    pop = (
-        fetch_population_exposure(lat, lon, area_ha)
-        if include_population
-        else _population_heuristic(lat, lon, area_ha)
-    )
+        pop = (
+            fetch_population_exposure(lat, lon, area_ha)
+            if include_population
+            else _population_heuristic(lat, lon, area_ha)
+        )
+    else:
+        # FAST: never call GEE (avoids timeout / hang on Render free tier)
+        elevation_m = fetch_elevation_open_meteo(lat, lon)
+        elevation_source = "Open-Meteo" if elevation_m is not None else None
+        if elevation_m is None:
+            elevation_m = fetch_elevation_open_elevation(lat, lon)
+            elevation_source = "Open-Elevation" if elevation_m is not None else None
+        pop = _population_heuristic(lat, lon, area_ha) if include_population else {
+            "danger_population": 0,
+            "warning_population": 0,
+            "source": "skipped",
+        }
 
     result = compute_early_warning(
         area_ha=area_ha,
@@ -299,11 +318,12 @@ def assess_lake(
         },
         "data_sources": {
             "elevation": elevation_source,
-            "growth": "GEE Sentinel-2 NDWI" if growth is not None else "unavailable",
+            "growth": "GEE Sentinel-2 NDWI" if growth is not None else "unavailable (enable GEE scan)",
             "population": pop.get("source"),
             "glacier": "reference glacier points (GB)",
             "temperature": temp.get("source"),
-            "gee_ready": bool(GEE_READY or _init_ee()),
+            "gee_ready": bool(GEE_READY),
+            "mode": "gee" if use_gee else "fast",
         },
     }
 
@@ -353,21 +373,21 @@ def score_one_lake(
 
 
 @router.get("/monitor")
-@limiter.limit("5/minute")
+@limiter.limit("30/minute")
 def monitor_all_lakes(
     request: Request,
     use_gee: bool = Query(
         False,
         description="If true, query GEE for growth + population (slow). Default fast hybrid score.",
     ),
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(46, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
     """
     Flood monitoring board: score all registered lakes.
 
-    Fast mode (default): area + elevation (Open-Meteo) + glacier heuristic.
-    GEE mode: also growth rate + WorldPop exposure (requires EE credentials).
+    Fast mode (default): area + Open-Meteo elev/temp + glacier heuristic + pop heuristic.
+    GEE mode: also growth rate + WorldPop (slow; needs EE credentials).
     """
     lakes: List[LakeModel] = (
         db.query(LakeModel)
@@ -376,9 +396,11 @@ def monitor_all_lakes(
         .all()
     )
 
+    # One regional temperature for all lakes (avoids 50 Open-Meteo calls)
+    shared_temp = fetch_temperature(35.92, 74.31)
+
     results = []
-    # Parallelize lightweight elevation fetches; GEE kept sequential-ish via workers=3
-    workers = 6 if not use_gee else 3
+    workers = 8 if not use_gee else 2
 
     def _job(lake: LakeModel):
         return assess_lake(
@@ -388,7 +410,8 @@ def monitor_all_lakes(
             lat=lake.latitude,
             lon=lake.longitude,
             use_gee=use_gee,
-            include_population=True,  # always estimate people/area impact
+            include_population=True,
+            shared_temp=shared_temp,
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -403,6 +426,17 @@ def monitor_all_lakes(
                     "name": lake.name,
                     "error": str(e),
                     "early_warning": classify_level(0),
+                    "flood_impact": build_flood_impact(area_ha=lake.area_ha, lat=lake.latitude, lon=lake.longitude),
+                    "flood_prediction": predict_flood_likelihood(
+                        early_warning_score=0,
+                        early_warning_level="Normal",
+                        growth_pct_per_year=None,
+                        temperature_c=None,
+                        forecast_max_c=None,
+                        elevation_m=None,
+                        glacier_distance_km=None,
+                        area_ha=lake.area_ha,
+                    ),
                 })
 
     # Sort Critical → Normal, then by score

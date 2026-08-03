@@ -120,6 +120,9 @@ function AppContent() {
   const [basinsData, setBasinsData] = useState(null);
   const [basinsLoading, setBasinsLoading] = useState(false);
   const [selectedBasinId, setSelectedBasinId] = useState(null);
+  const [basinThumbNdwi, setBasinThumbNdwi] = useState(null);
+  const [basinThumbRgb, setBasinThumbRgb] = useState(null);
+  const [basinThumbLoading, setBasinThumbLoading] = useState(false);
 
   // Historical
   const [histLakeId, setHistLakeId] = useState('');
@@ -559,17 +562,61 @@ function AppContent() {
     setEwLoading(true);
     setEwSelected(null);
     try {
+      // Fast path default — avoid GEE timeouts; boolean must be string for some proxies
       const res = await axios.get(`${API_BASE}/early-warning/monitor`, {
-        params: { use_gee: useGee, limit: 50 },
-        timeout: useGee ? 300000 : 180000,
+        params: { use_gee: useGee ? 'true' : 'false', limit: 46 },
+        timeout: useGee ? 300000 : 90000,
       });
+      if (!res.data?.lakes) {
+        throw new Error('Invalid response from early-warning API');
+      }
       setEwData(res.data);
     } catch (err) {
+      console.error('Flood monitoring scan failed', err);
+      const status = err?.response?.status;
       const detail = err?.response?.data?.detail || err.message || 'Failed to load early warning scores';
-      alert(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      const msg = status === 404
+        ? 'Early-warning API not found. Restart the backend (uvicorn) so /early-warning routes are loaded.'
+        : status === 429
+          ? 'Rate limited — wait a minute and try again.'
+          : (typeof detail === 'string' ? detail : JSON.stringify(detail));
+      alert(`Flood Monitoring failed: ${msg}`);
       setEwData(null);
     } finally {
       setEwLoading(false);
+    }
+  };
+
+  const loadBasinSatellite = async (basin) => {
+    const lat = basin?.center?.lat;
+    const lon = basin?.center?.lon;
+    if (!lat || !lon) {
+      setBasinThumbNdwi(null);
+      setBasinThumbRgb(null);
+      return;
+    }
+    setBasinThumbLoading(true);
+    setBasinThumbNdwi(null);
+    setBasinThumbRgb(null);
+    try {
+      const [ndwiRes, rgbRes] = await Promise.all([
+        axios.get(`${API_BASE}/gee/thumbnail`, {
+          params: { lat, lon, mode: 'ndwi' },
+          timeout: 120000,
+        }),
+        axios.get(`${API_BASE}/gee/thumbnail`, {
+          params: { lat, lon, mode: 'rgb' },
+          timeout: 120000,
+        }),
+      ]);
+      setBasinThumbNdwi(ndwiRes.data?.url || null);
+      setBasinThumbRgb(rgbRes.data?.url || null);
+    } catch (err) {
+      console.error('Basin satellite load failed', err);
+      setBasinThumbNdwi(null);
+      setBasinThumbRgb(null);
+    } finally {
+      setBasinThumbLoading(false);
     }
   };
 
@@ -578,12 +625,22 @@ function AppContent() {
     try {
       const res = await axios.get(`${API_BASE}/early-warning/basins`, { timeout: 60000 });
       setBasinsData(res.data);
-      if (res.data?.basins?.length && !selectedBasinId) {
-        setSelectedBasinId(res.data.basins[0].id);
+      const list = res.data?.basins || [];
+      const first = list[0];
+      if (first) {
+        const nextId = list.some((b) => b.id === selectedBasinId) ? selectedBasinId : first.id;
+        setSelectedBasinId(nextId);
+        const active = list.find((b) => b.id === nextId) || first;
+        loadBasinSatellite(active);
       }
     } catch (err) {
+      console.error('Basins load failed', err);
+      const status = err?.response?.status;
       const detail = err?.response?.data?.detail || err.message || 'Failed to load basins';
-      alert(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      const msg = status === 404
+        ? 'Basins API not found. Restart the backend so /early-warning/basins is available.'
+        : (typeof detail === 'string' ? detail : JSON.stringify(detail));
+      alert(`GLOF Basins failed: ${msg}`);
       setBasinsData(null);
     } finally {
       setBasinsLoading(false);
@@ -2032,7 +2089,9 @@ function AppContent() {
                       whileHover={{ scale: 1.03 }}
                       whileTap={{ scale: 0.97 }}
                       disabled={basinsLoading}
-                      onClick={fetchBasins}
+                      onClick={async () => {
+                        await fetchBasins();
+                      }}
                       style={{
                         padding: '11px 18px', borderRadius: 12, border: 'none',
                         background: basinsLoading ? '#94a3b8' : 'linear-gradient(135deg,#5eead4,#38bdf8)',
@@ -2092,7 +2151,10 @@ function AppContent() {
                             return (
                               <button
                                 key={b.id}
-                                onClick={() => setSelectedBasinId(b.id)}
+                                onClick={() => {
+                                  setSelectedBasinId(b.id);
+                                  loadBasinSatellite(b);
+                                }}
                                 style={{
                                   textAlign: 'left', padding: '12px 14px', borderRadius: 12, cursor: 'pointer',
                                   border: active ? `1.5px solid ${pc}` : `1px solid ${pal.border}`,
@@ -2225,6 +2287,66 @@ function AppContent() {
                                   ))}
                                 </tbody>
                               </table>
+                            </div>
+
+                            {/* Live satellite — same sources as Historical tab */}
+                            <div style={{ marginTop: 18 }}>
+                              <div style={eyebrow}>Live Satellite</div>
+                              <h3 style={{ ...sectionTitle, fontSize: 15, marginBottom: 10 }}>
+                                Basin center · NDWI & True Color
+                              </h3>
+                              <p style={{ margin: '0 0 12px', fontSize: 12, color: pal.lo }}>
+                                Sentinel-2 via GEE at basin center
+                                {selected.center ? ` (${selected.center.lat}°N, ${selected.center.lon}°E)` : ''}
+                              </p>
+                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14 }}>
+                                <div style={{ background: pal.panelAlt, borderRadius: 12, padding: 12, border: `1px solid ${pal.border}` }}>
+                                  <div style={{ fontSize: 13, fontWeight: 700, color: pal.hi, marginBottom: 8 }}>NDWI / Water Highlight</div>
+                                  {basinThumbLoading ? (
+                                    <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
+                                      Loading NDWI…
+                                    </div>
+                                  ) : basinThumbNdwi ? (
+                                    <img
+                                      src={basinThumbNdwi}
+                                      alt={`${selected.name} NDWI`}
+                                      style={{ width: '100%', borderRadius: 10, border: `1px solid ${pal.border}`, display: 'block' }}
+                                    />
+                                  ) : (
+                                    <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo, fontSize: 12.5, textAlign: 'center', padding: 12 }}>
+                                      Image not available (needs GEE auth on server)
+                                    </div>
+                                  )}
+                                </div>
+                                <div style={{ background: pal.panelAlt, borderRadius: 12, padding: 12, border: `1px solid ${pal.border}` }}>
+                                  <div style={{ fontSize: 13, fontWeight: 700, color: pal.hi, marginBottom: 8 }}>True Color (RGB)</div>
+                                  {basinThumbLoading ? (
+                                    <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
+                                      Loading RGB…
+                                    </div>
+                                  ) : basinThumbRgb ? (
+                                    <img
+                                      src={basinThumbRgb}
+                                      alt={`${selected.name} RGB`}
+                                      style={{ width: '100%', borderRadius: 10, border: `1px solid ${pal.border}`, display: 'block' }}
+                                    />
+                                  ) : (
+                                    <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo, fontSize: 12.5, textAlign: 'center', padding: 12 }}>
+                                      Image not available (needs GEE auth on server)
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => loadBasinSatellite(selected)}
+                                disabled={basinThumbLoading}
+                                style={{
+                                  marginTop: 10, padding: '8px 12px', borderRadius: 8, border: `1px solid ${pal.border}`,
+                                  background: pal.panelAlt, color: pal.signal, fontWeight: 700, fontSize: 12, cursor: 'pointer'
+                                }}
+                              >
+                                {basinThumbLoading ? 'Loading…' : 'Reload satellite images'}
+                              </button>
                             </div>
 
                             {selected.lakes?.length > 0 && (
