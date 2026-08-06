@@ -140,6 +140,10 @@ function AppContent() {
   const [populationRisk, setPopulationRisk] = useState('All');
   const [exposureData, setExposureData] = useState({});
   const [exposureLoading, setExposureLoading] = useState(false);
+  /** How many High/Medium lakes to score with WorldPop (kept limited for GEE/Render). */
+  const [exposureLimit, setExposureLimit] = useState(10);
+  const [exposureProgress, setExposureProgress] = useState(null); // { done, total, current }
+  const [exposureMeta, setExposureMeta] = useState(null); // last run: limit, high/medium counts
 
   // Flood Monitoring / Early Warning
   const [ewData, setEwData] = useState(null);
@@ -155,6 +159,7 @@ function AppContent() {
   const [selectedBasinId, setSelectedBasinId] = useState(null);
   const [basinThumbNdwi, setBasinThumbNdwi] = useState(null);
   const [basinThumbRgb, setBasinThumbRgb] = useState(null);
+  const [basinThumbSar, setBasinThumbSar] = useState(null);
   const [basinThumbLoading, setBasinThumbLoading] = useState(false);
 
   // Historical
@@ -163,6 +168,7 @@ function AppContent() {
   const [histLoading, setHistLoading] = useState(false);
   const [thumbNdwi, setThumbNdwi] = useState(null);
   const [thumbRgb, setThumbRgb] = useState(null);
+  const [thumbSar, setThumbSar] = useState(null);
   const [thumbLoading, setThumbLoading] = useState(false);
 
   // Lake Details modal (inventory → Details)
@@ -267,45 +273,101 @@ function AppContent() {
     return `${shown}${unit}`;
   };
 
-  const fetchExposureForLakes = async (lakesList) => {
+  const fetchExposureForLakes = async (lakesList, limitOverride) => {
+    const limit = Number(limitOverride ?? exposureLimit) || 10;
     setExposureLoading(true);
-    const results = {};
-    const targets = lakesList.filter(l => {
-      const r = calculateRisk(l.area_ha);
-      return (r === 'High' || r === 'Medium') && l.latitude && l.longitude;
-    }).slice(0, 12);
+    setExposureProgress({ done: 0, total: 0, current: null });
+    setExposureMeta(null);
 
-    for (const lake of targets) {
+    const riskRank = { High: 0, Medium: 1, Low: 2 };
+    // Eligible: coords + High/Medium risk; always prioritize High first, then larger area
+    const eligible = lakesList
+      .filter((l) => {
+        const r = calculateRisk(l.area_ha);
+        return (r === 'High' || r === 'Medium') && l.latitude != null && l.longitude != null;
+      })
+      .sort((a, b) => {
+        const ra = riskRank[calculateRisk(a.area_ha)] ?? 9;
+        const rb = riskRank[calculateRisk(b.area_ha)] ?? 9;
+        if (ra !== rb) return ra - rb;
+        return (Number(b.area_ha) || 0) - (Number(a.area_ha) || 0);
+      });
+
+    const targets = eligible.slice(0, Math.max(1, Math.min(limit, 15)));
+    const highCount = targets.filter((l) => calculateRisk(l.area_ha) === 'High').length;
+    const mediumCount = targets.length - highCount;
+
+    setExposureProgress({ done: 0, total: targets.length, current: null });
+
+    const results = {};
+    for (let i = 0; i < targets.length; i++) {
+      const lake = targets[i];
+      setExposureProgress({
+        done: i,
+        total: targets.length,
+        current: lake.name,
+      });
       try {
         const risk = calculateRisk(lake.area_ha);
         const res = await axios.get(`${API_BASE}/gee/exposure`, {
-          params: { lat: lake.latitude, lon: lake.longitude, risk_level: risk }
+          params: { lat: lake.latitude, lon: lake.longitude, risk_level: risk },
+          timeout: 120000,
         });
-        results[lake.id] = res.data;
+        results[lake.id] = { ...res.data, lake_name: lake.name, risk_level: risk };
       } catch {
-        results[lake.id] = { danger_population: 0, warning_population: 0, error: true };
+        results[lake.id] = {
+          danger_population: 0,
+          warning_population: 0,
+          error: true,
+          lake_name: lake.name,
+          risk_level: calculateRisk(lake.area_ha),
+        };
       }
+      setExposureData({ ...results });
+      setExposureProgress({
+        done: i + 1,
+        total: targets.length,
+        current: lake.name,
+      });
     }
+
+    setExposureMeta({
+      limit,
+      analysed: targets.length,
+      eligible: eligible.length,
+      high: highCount,
+      medium: mediumCount,
+      names: targets.map((l) => l.name),
+    });
     setExposureData(results);
     setExposureLoading(false);
+    setExposureProgress(null);
   };
 
-  const fetchThumbnails = async (lake, { setNdwi, setRgb, setLoading }) => {
+  const fetchThumbnails = async (lake, { setNdwi, setRgb, setSar, setLoading }) => {
     if (!lake?.latitude || !lake?.longitude) return;
     setLoading(true);
-    setNdwi(null);
-    setRgb(null);
+    setNdwi?.(null);
+    setRgb?.(null);
+    setSar?.(null);
     try {
-      const [ndwiRes, rgbRes] = await Promise.all([
+      const jobs = [
         axios.get(`${API_BASE}/gee/thumbnail`, {
           params: { lat: lake.latitude, lon: lake.longitude, mode: 'ndwi' }
         }),
         axios.get(`${API_BASE}/gee/thumbnail`, {
           params: { lat: lake.latitude, lon: lake.longitude, mode: 'rgb' }
-        })
-      ]);
-      setNdwi(ndwiRes.data.url);
-      setRgb(rgbRes.data.url);
+        }),
+      ];
+      if (setSar) {
+        jobs.push(axios.get(`${API_BASE}/gee/thumbnail`, {
+          params: { lat: lake.latitude, lon: lake.longitude, mode: 'sar' }
+        }));
+      }
+      const results = await Promise.all(jobs);
+      setNdwi?.(results[0]?.data?.url || null);
+      setRgb?.(results[1]?.data?.url || null);
+      if (setSar) setSar(results[2]?.data?.url || null);
     } catch {
       // optional satellite imagery
     } finally {
@@ -319,6 +381,7 @@ function AppContent() {
     setHistData(null);
     setThumbNdwi(null);
     setThumbRgb(null);
+    setThumbSar(null);
     try {
       const res = await axios.get(`${API_BASE}/gee/historical`, {
         params: { lat: lake.latitude, lon: lake.longitude }
@@ -333,6 +396,7 @@ function AppContent() {
     await fetchThumbnails(lake, {
       setNdwi: setThumbNdwi,
       setRgb: setThumbRgb,
+      setSar: setThumbSar,
       setLoading: setThumbLoading,
     });
   };
@@ -451,9 +515,32 @@ function AppContent() {
   const totalDangerPop = Object.values(exposureData).reduce((s, e) => s + (e.danger_population || 0), 0);
   const totalWarningPop = Object.values(exposureData).reduce((s, e) => s + (e.warning_population || 0), 0);
 
-  const histChartData = (histData?.years || [])
-    .filter(y => y.area_ha != null)
-    .map(y => ({ year: String(y.year), area: y.area_ha }));
+  // Hybrid preferred series + dual optical/SAR for comparison charts
+  const histChartData = (() => {
+    const years = histData?.years || [];
+    const optical = histData?.optical_years || [];
+    const sar = histData?.sar_years || [];
+    const byYear = {};
+    years.forEach((y) => {
+      byYear[y.year] = {
+        year: String(y.year),
+        area: y.area_ha,
+        hybrid: y.area_ha,
+        sensor: y.sensor,
+      };
+    });
+    optical.forEach((y) => {
+      if (!byYear[y.year]) byYear[y.year] = { year: String(y.year) };
+      byYear[y.year].optical = y.area_ha;
+    });
+    sar.forEach((y) => {
+      if (!byYear[y.year]) byYear[y.year] = { year: String(y.year) };
+      byYear[y.year].sar = y.area_ha;
+    });
+    return Object.values(byYear)
+      .filter((r) => r.hybrid != null || r.optical != null || r.sar != null || r.area != null)
+      .sort((a, b) => Number(a.year) - Number(b.year));
+  })();
 
   const selectedHistLake = lakes.find(l => String(l.id) === String(histLakeId));
 
@@ -812,56 +899,71 @@ function AppContent() {
       console.warn('Basin has no center coordinates', basin);
       setBasinThumbNdwi(null);
       setBasinThumbRgb(null);
+      setBasinThumbSar(null);
       setBasinThumbLoading(false);
       return;
     }
     setBasinThumbLoading(true);
     setBasinThumbNdwi(null);
     setBasinThumbRgb(null);
+    setBasinThumbSar(null);
     // Use backend-proxied PNG endpoints (browser-safe). Wider buffer for basin overview.
     const qs = (mode) =>
       `${API_BASE}/gee/thumbnail-image?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&mode=${mode}&buffer_m=12000&t=${Date.now()}`;
     // Prefetch so we only flip state when images actually resolve
     const loadImg = (src) =>
-      new Promise((resolve, reject) => {
+      new Promise((resolve) => {
         const img = new Image();
         img.onload = () => resolve(src);
-        img.onerror = () => reject(new Error(`Failed to load ${src}`));
+        img.onerror = () => resolve(null);
         img.src = src;
       });
     try {
-      const [ndwiSrc, rgbSrc] = await Promise.all([
+      const [ndwiSrc, rgbSrc, sarSrc] = await Promise.all([
         loadImg(qs('ndwi')),
         loadImg(qs('rgb')),
+        loadImg(qs('sar')),
       ]);
       setBasinThumbNdwi(ndwiSrc);
       setBasinThumbRgb(rgbSrc);
+      setBasinThumbSar(sarSrc);
+      if (!ndwiSrc && !rgbSrc && !sarSrc) {
+        // Fallback: try JSON thumbnail URLs (older path)
+        try {
+          const [ndwiRes, rgbRes, sarRes] = await Promise.all([
+            axios.get(`${API_BASE}/gee/thumbnail`, {
+              params: { lat, lon, mode: 'ndwi', buffer_m: 12000 },
+              timeout: 120000,
+            }),
+            axios.get(`${API_BASE}/gee/thumbnail`, {
+              params: { lat, lon, mode: 'rgb', buffer_m: 12000 },
+              timeout: 120000,
+            }),
+            axios.get(`${API_BASE}/gee/thumbnail`, {
+              params: { lat, lon, mode: 'sar', buffer_m: 12000 },
+              timeout: 120000,
+            }),
+          ]);
+          setBasinThumbNdwi(ndwiRes.data?.url || null);
+          setBasinThumbRgb(rgbRes.data?.url || null);
+          setBasinThumbSar(sarRes.data?.url || null);
+          if (!ndwiRes.data?.url && !rgbRes.data?.url && !sarRes.data?.url) {
+            alert(ndwiRes.data?.error || rgbRes.data?.error || 'Satellite images unavailable for this basin');
+          }
+        } catch (err2) {
+          console.error('Basin satellite fallback failed', err2);
+          setBasinThumbNdwi(null);
+          setBasinThumbRgb(null);
+          setBasinThumbSar(null);
+          const detail = err2?.response?.data?.detail || err2.message;
+          alert(`Basin satellite failed: ${typeof detail === 'string' ? detail : 'GEE thumbnail error'}`);
+        }
+      }
     } catch (err) {
       console.error('Basin satellite load failed', err);
-      // Fallback: try JSON thumbnail URLs (older path)
-      try {
-        const [ndwiRes, rgbRes] = await Promise.all([
-          axios.get(`${API_BASE}/gee/thumbnail`, {
-            params: { lat, lon, mode: 'ndwi', buffer_m: 12000 },
-            timeout: 120000,
-          }),
-          axios.get(`${API_BASE}/gee/thumbnail`, {
-            params: { lat, lon, mode: 'rgb', buffer_m: 12000 },
-            timeout: 120000,
-          }),
-        ]);
-        setBasinThumbNdwi(ndwiRes.data?.url || null);
-        setBasinThumbRgb(rgbRes.data?.url || null);
-        if (!ndwiRes.data?.url && !rgbRes.data?.url) {
-          alert(ndwiRes.data?.error || rgbRes.data?.error || 'Satellite images unavailable for this basin');
-        }
-      } catch (err2) {
-        console.error('Basin satellite fallback failed', err2);
-        setBasinThumbNdwi(null);
-        setBasinThumbRgb(null);
-        const detail = err2?.response?.data?.detail || err2.message;
-        alert(`Basin satellite failed: ${typeof detail === 'string' ? detail : 'GEE thumbnail error'}`);
-      }
+      setBasinThumbNdwi(null);
+      setBasinThumbRgb(null);
+      setBasinThumbSar(null);
     } finally {
       setBasinThumbLoading(false);
     }
@@ -1343,7 +1445,7 @@ function AppContent() {
         <div style={{ height: 260, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: pal.mid, gap: 10 }}>
           <div style={{ fontSize: 14 }}>No exposure data yet</div>
           <div style={{ fontSize: 12, color: pal.lo }}>
-            Go to the <strong style={{ color: pal.accent }}>Population</strong> tab and click “Calculate Population Exposure”
+            Go to the <strong style={{ color: pal.accent }}>Population</strong> tab, choose a limit (5 / 10 / 15), then calculate exposure
           </div>
         </div>
       ) : (
@@ -1376,6 +1478,11 @@ function AppContent() {
                 <div style={{ ...cardStyle, padding: '18px 20px' }}>
                   <div className="mono-label" style={{ fontSize: 10.5, color: pal.mid, marginBottom: 6 }}>Lakes Analysed</div>
                   <div style={{ fontFamily: 'var(--font-mono)', fontSize: 28, fontWeight: 700, color: pal.signal }}>{Object.keys(exposureData).length}</div>
+                  {exposureMeta && (
+                    <div style={{ marginTop: 4, fontSize: 11, color: pal.mid }}>
+                      of {exposureMeta.limit} limit · {exposureMeta.high} High / {exposureMeta.medium} Medium
+                    </div>
+                  )}
                 </div>
                 <div style={{ ...cardStyle, padding: '18px 20px' }}>
                   <div className="mono-label" style={{ fontSize: 10.5, color: pal.mid, marginBottom: 6 }}>People in Danger Zones</div>
@@ -1387,22 +1494,176 @@ function AppContent() {
                 </div>
               </div>
 
-              <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-                <button
-                  onClick={() => fetchExposureForLakes(lakes)}
-                  disabled={exposureLoading}
-                  className="btn-3d"
-                  style={{
-                    padding: '10px 18px', borderRadius: 10, border: 'none',
-                    background: exposureLoading ? '#94a3b8' : 'linear-gradient(135deg,#f0433a,#f5a524)',
-                    color: '#fff', fontWeight: 800, cursor: 'pointer', fontSize: 13
-                  }}
-                >
-                  {exposureLoading ? 'Calculating with WorldPop...' : 'Calculate Population Exposure'}
-                </button>
-                <span style={{ fontSize: 12, color: pal.mid }}>
-                  Uses WorldPop via Google Earth Engine · Limited to High & Medium risk lakes (max 12)
-                </span>
+              {/* Interactive controls */}
+              <div style={{ ...cardStyle, padding: 20 }}>
+                <div style={eyebrow}>WorldPop scan settings</div>
+                <h3 style={{ ...sectionTitle, marginBottom: 8, fontSize: 16 }}>Population Exposure</h3>
+                <p style={{ margin: '0 0 16px', fontSize: 13, color: pal.mid, lineHeight: 1.5, maxWidth: 720 }}>
+                  Uses WorldPop via Google Earth Engine. Only <strong>High</strong> and <strong>Medium</strong> risk lakes
+                  with coordinates are scored. <strong>High risk is always prioritised first</strong>, then larger medium lakes.
+                  Keep a limit so Render/GEE does not time out.
+                </p>
+
+                <div style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: 16,
+                  alignItems: 'flex-end',
+                }}>
+                  {/* Limit dropdown + chips */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 200 }}>
+                    <label
+                      htmlFor="exposure-limit"
+                      style={{ fontSize: 12, fontWeight: 700, color: pal.hi }}
+                    >
+                      Lakes to analyse (limit)
+                    </label>
+                    <select
+                      id="exposure-limit"
+                      value={exposureLimit}
+                      disabled={exposureLoading}
+                      onChange={(e) => setExposureLimit(Number(e.target.value))}
+                      style={{
+                        padding: '10px 14px',
+                        borderRadius: 10,
+                        border: `1px solid ${pal.border}`,
+                        background: pal.panelAlt,
+                        color: pal.hi,
+                        fontSize: 14,
+                        fontWeight: 600,
+                        cursor: exposureLoading ? 'not-allowed' : 'pointer',
+                        minWidth: 180,
+                      }}
+                    >
+                      <option value={5}>5 lakes</option>
+                      <option value={10}>10 lakes (default)</option>
+                      <option value={15}>15 lakes</option>
+                    </select>
+                  </div>
+
+                  {/* Quick pick chips — same state as dropdown */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: pal.hi }}>Quick select</span>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      {[5, 10, 15].map((n) => {
+                        const active = exposureLimit === n;
+                        return (
+                          <button
+                            key={n}
+                            type="button"
+                            disabled={exposureLoading}
+                            onClick={() => setExposureLimit(n)}
+                            aria-pressed={active}
+                            style={{
+                              padding: '9px 16px',
+                              borderRadius: 999,
+                              border: active ? '1.5px solid #f0433a' : `1px solid ${pal.border}`,
+                              background: active
+                                ? (isDark ? 'rgba(240,67,58,0.18)' : '#fef2f2')
+                                : pal.panelAlt,
+                              color: active ? '#f0433a' : pal.hi,
+                              fontWeight: 800,
+                              fontSize: 13,
+                              cursor: exposureLoading ? 'not-allowed' : 'pointer',
+                              fontFamily: 'var(--font-mono)',
+                            }}
+                          >
+                            {n}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => fetchExposureForLakes(lakes, exposureLimit)}
+                    disabled={exposureLoading || !lakes.length}
+                    className="btn-3d"
+                    style={{
+                      padding: '11px 20px',
+                      borderRadius: 12,
+                      border: 'none',
+                      background: exposureLoading ? '#94a3b8' : 'linear-gradient(135deg,#f0433a,#f5a524)',
+                      color: '#fff',
+                      fontWeight: 800,
+                      cursor: exposureLoading || !lakes.length ? 'not-allowed' : 'pointer',
+                      fontSize: 13,
+                      marginLeft: 'auto',
+                    }}
+                  >
+                    {exposureLoading
+                      ? `Calculating… ${exposureProgress ? `${exposureProgress.done}/${exposureProgress.total}` : ''}`
+                      : `Calculate top ${exposureLimit} lakes`}
+                  </button>
+                </div>
+
+                {/* Live progress */}
+                {exposureLoading && exposureProgress && (
+                  <div style={{ marginTop: 16 }}>
+                    <div style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      fontSize: 12,
+                      color: pal.mid,
+                      marginBottom: 6,
+                      fontFamily: 'var(--font-mono)',
+                    }}>
+                      <span>
+                        {exposureProgress.done}/{exposureProgress.total}
+                        {exposureProgress.current ? ` · ${exposureProgress.current}` : ''}
+                      </span>
+                      <span>
+                        {exposureProgress.total
+                          ? Math.round((exposureProgress.done / exposureProgress.total) * 100)
+                          : 0}%
+                      </span>
+                    </div>
+                    <div style={{
+                      height: 8,
+                      borderRadius: 99,
+                      background: isDark ? '#0a1520' : '#e8eef3',
+                      border: `1px solid ${pal.border}`,
+                      overflow: 'hidden',
+                    }}>
+                      <div style={{
+                        height: '100%',
+                        width: `${exposureProgress.total
+                          ? (exposureProgress.done / exposureProgress.total) * 100
+                          : 0}%`,
+                        background: 'linear-gradient(90deg,#f0433a,#f5a524)',
+                        transition: 'width 0.25s ease',
+                      }} />
+                    </div>
+                  </div>
+                )}
+
+                {/* Last run summary */}
+                {exposureMeta && !exposureLoading && (
+                  <div style={{
+                    marginTop: 14,
+                    padding: '12px 14px',
+                    borderRadius: 12,
+                    background: pal.panelAlt,
+                    border: `1px solid ${pal.border}`,
+                    fontSize: 12.5,
+                    color: pal.mid,
+                    lineHeight: 1.5,
+                  }}>
+                    Last run: analysed <strong style={{ color: pal.hi }}>{exposureMeta.analysed}</strong> lakes
+                    (limit {exposureMeta.limit}) ·{' '}
+                    <span style={{ color: '#f0433a', fontWeight: 700 }}>{exposureMeta.high} High</span>
+                    {' · '}
+                    <span style={{ color: '#f5a524', fontWeight: 700 }}>{exposureMeta.medium} Medium</span>
+                    {exposureMeta.eligible > exposureMeta.analysed && (
+                      <span> · {exposureMeta.eligible - exposureMeta.analysed} more eligible not scored (raise limit)</span>
+                    )}
+                    {exposureMeta.names?.length > 0 && (
+                      <div style={{ marginTop: 6, color: pal.lo }}>
+                        Order: {exposureMeta.names.join(' → ')}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div style={{ ...cardStyle, padding: 24 }}>
@@ -1427,8 +1688,9 @@ function AppContent() {
     <div style={{ ...cardStyle, padding: 24 }}>
       <div style={eyebrow}>Time Series</div>
       <h3 style={{ ...sectionTitle, marginBottom: 16 }}>Lake Area History</h3>
-      <p style={{ margin: '0 0 16px', color: pal.mid, fontSize: 13 }}>
-        Data source: Google Earth Engine · Sentinel-2 NDWI summer composites
+      <p style={{ margin: '0 0 16px', color: pal.mid, fontSize: 13, lineHeight: 1.5 }}>
+        Dual sensors via Google Earth Engine: <strong>Sentinel-2 NDWI</strong> (optical) +{' '}
+        <strong>Sentinel-1 SAR</strong> (cloud-penetrating). Hybrid series uses SAR when optical summers are cloudy.
       </p>
 
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -1477,15 +1739,21 @@ function AppContent() {
     {histData && (
       <>
         {/* KPI Cards */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 16 }}>
           <div style={{ ...cardStyle, padding: '18px 20px' }}>
             <div className="mono-label" style={{ fontSize: 10.5, color: pal.mid, marginBottom: 6 }}>Selected Lake</div>
             <div style={{ fontWeight: 700, color: pal.hi, fontSize: 16 }}>{selectedHistLake?.name || '—'}</div>
           </div>
           <div style={{ ...cardStyle, padding: '18px 20px' }}>
-            <div className="mono-label" style={{ fontSize: 10.5, color: pal.mid, marginBottom: 6 }}>Trend</div>
+            <div className="mono-label" style={{ fontSize: 10.5, color: pal.mid, marginBottom: 6 }}>Hybrid Trend</div>
             <div style={{ fontFamily: 'var(--font-mono)', fontSize: 22, fontWeight: 700, color: trendColor, textTransform: 'capitalize' }}>
               {histData.trend}
+            </div>
+          </div>
+          <div style={{ ...cardStyle, padding: '18px 20px' }}>
+            <div className="mono-label" style={{ fontSize: 10.5, color: pal.mid, marginBottom: 6 }}>Optical / SAR</div>
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 14, fontWeight: 700, color: pal.hi, textTransform: 'capitalize' }}>
+              {histData.optical_trend || '—'} / {histData.sar_trend || '—'}
             </div>
           </div>
           <div style={{ ...cardStyle, padding: '18px 20px' }}>
@@ -1496,28 +1764,57 @@ function AppContent() {
           </div>
         </div>
 
-        {/* Line Chart */}
+        {/* Line Chart — hybrid + dual sensors */}
         <div style={{ ...cardStyle, padding: 24 }}>
           <div style={eyebrow}>Area Change</div>
-          <h3 style={{ ...sectionTitle, marginBottom: 16 }}>Surface Area Over Time (ha)</h3>
+          <h3 style={{ ...sectionTitle, marginBottom: 8 }}>Surface Area Over Time (ha)</h3>
+          <p style={{ margin: '0 0 16px', fontSize: 12.5, color: pal.mid }}>
+            Hybrid prefers S2 when water is detected; SAR fills cloudy years. Optical and SAR lines shown for comparison.
+          </p>
           {histChartData.length === 0 ? (
             <div style={{ height: 280, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
               No valid year data
             </div>
           ) : (
-            <ResponsiveContainer width="100%" height={300}>
+            <ResponsiveContainer width="100%" height={320}>
               <LineChart data={histChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={pal.border} />
                 <XAxis dataKey="year" tick={{ fill: pal.mid, fontSize: 12 }} />
                 <YAxis tick={{ fill: pal.mid, fontSize: 12 }} unit=" ha" />
-                <Tooltip contentStyle={chartTooltipStyle} formatter={(v) => [`${v} ha`, 'Area']} />
+                <Tooltip
+                  contentStyle={chartTooltipStyle}
+                  formatter={(v, name) => [`${v != null ? v : '—'} ha`, name]}
+                />
+                <Legend formatter={(value) => <span style={{ color: pal.hi, fontSize: 12 }}>{value}</span>} />
                 <Line
                   type="monotone"
-                  dataKey="area"
-                  stroke="#38bdf8"
+                  dataKey="hybrid"
+                  name="Hybrid (S2→SAR)"
+                  stroke="#5eead4"
                   strokeWidth={3}
-                  dot={{ r: 5, fill: '#5eead4' }}
-                  activeDot={{ r: 7 }}
+                  connectNulls
+                  dot={{ r: 4, fill: '#5eead4' }}
+                  activeDot={{ r: 6 }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="optical"
+                  name="Sentinel-2 NDWI"
+                  stroke="#38bdf8"
+                  strokeWidth={2}
+                  strokeDasharray="4 3"
+                  connectNulls
+                  dot={{ r: 3, fill: '#38bdf8' }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="sar"
+                  name="Sentinel-1 SAR"
+                  stroke="#fbbf24"
+                  strokeWidth={2}
+                  strokeDasharray="2 2"
+                  connectNulls
+                  dot={{ r: 3, fill: '#fbbf24' }}
                 />
               </LineChart>
             </ResponsiveContainer>
@@ -1525,48 +1822,64 @@ function AppContent() {
         </div>
 
         {/* Satellite Images */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 20 }}>
           <div style={{ ...cardStyle, padding: 20 }}>
-            <div style={eyebrow}>Live Satellite</div>
+            <div style={eyebrow}>Optical · S2</div>
             <h3 style={{ ...sectionTitle, marginBottom: 12 }}>NDWI / Water Highlight</h3>
             {thumbLoading ? (
-              <div style={{ height: 280, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
+              <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
                 Loading image...
               </div>
             ) : thumbNdwi ? (
               <img src={thumbNdwi} alt="NDWI" style={{ width: '100%', borderRadius: 12, border: `1px solid ${pal.border}` }} />
             ) : (
-              <div style={{ height: 280, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo }}>
+              <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo }}>
                 Image not available
               </div>
             )}
           </div>
 
           <div style={{ ...cardStyle, padding: 20 }}>
-            <div style={eyebrow}>Live Satellite</div>
+            <div style={eyebrow}>Optical · S2</div>
             <h3 style={{ ...sectionTitle, marginBottom: 12 }}>True Color (RGB)</h3>
             {thumbLoading ? (
-              <div style={{ height: 280, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
+              <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
                 Loading image...
               </div>
             ) : thumbRgb ? (
               <img src={thumbRgb} alt="RGB" style={{ width: '100%', borderRadius: 12, border: `1px solid ${pal.border}` }} />
             ) : (
-              <div style={{ height: 280, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo }}>
+              <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo }}>
                 Image not available
+              </div>
+            )}
+          </div>
+
+          <div style={{ ...cardStyle, padding: 20 }}>
+            <div style={eyebrow}>Radar · S1</div>
+            <h3 style={{ ...sectionTitle, marginBottom: 12 }}>SAR VV (all-weather)</h3>
+            {thumbLoading ? (
+              <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
+                Loading SAR...
+              </div>
+            ) : thumbSar ? (
+              <img src={thumbSar} alt="SAR VV" style={{ width: '100%', borderRadius: 12, border: `1px solid ${pal.border}` }} />
+            ) : (
+              <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo }}>
+                SAR not available
               </div>
             )}
           </div>
         </div>
 
-        {/* Year-by-Year Table (this was the missing part) */}
+        {/* Year-by-Year Table */}
         <div style={{ ...cardStyle, padding: 24 }}>
           <div style={eyebrow}>Raw Series</div>
-          <h3 style={{ ...sectionTitle, marginBottom: 16 }}>Year-by-Year Area</h3>
+          <h3 style={{ ...sectionTitle, marginBottom: 16 }}>Year-by-Year Area (hybrid + dual sensors)</h3>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ background: pal.panelAlt }}>
-                {['Year', 'Area (ha)', 'Source'].map(h => (
+                {['Year', 'Hybrid (ha)', 'S2 Optical', 'S1 SAR', 'Sensor used', 'Source'].map(h => (
                   <th key={h} className="mono-label" style={{ padding: '12px 14px', fontSize: 10.5, color: pal.mid, textAlign: 'left' }}>
                     {h}
                   </th>
@@ -1582,7 +1895,16 @@ function AppContent() {
                   <td style={{ padding: '12px 14px', fontFamily: 'var(--font-mono)', fontWeight: 700, color: pal.signal }}>
                     {y.area_ha != null ? y.area_ha : '—'}
                   </td>
-                  <td style={{ padding: '12px 14px', color: pal.mid, fontSize: 13 }}>
+                  <td style={{ padding: '12px 14px', fontFamily: 'var(--font-mono)', color: pal.mid }}>
+                    {y.optical_area_ha != null ? y.optical_area_ha : '—'}
+                  </td>
+                  <td style={{ padding: '12px 14px', fontFamily: 'var(--font-mono)', color: '#fbbf24' }}>
+                    {y.sar_area_ha != null ? y.sar_area_ha : '—'}
+                  </td>
+                  <td style={{ padding: '12px 14px', fontSize: 12, color: y.sensor === 'sentinel-1-sar' ? '#fbbf24' : '#38bdf8', fontWeight: 700 }}>
+                    {y.sensor === 'sentinel-1-sar' ? 'SAR' : y.sensor === 'sentinel-2' ? 'Optical' : '—'}
+                  </td>
+                  <td style={{ padding: '12px 14px', color: pal.mid, fontSize: 12 }}>
                     {y.source || histData.source}
                   </td>
                 </tr>
@@ -1915,13 +2237,15 @@ function AppContent() {
                       <div style={eyebrow}>GLOF Early Warning Score</div>
                       <h3 style={{ ...sectionTitle, marginBottom: 8 }}>Flood Monitoring Board</h3>
                       <p style={{ margin: 0, color: pal.mid, fontSize: 13.5, lineHeight: 1.55 }}>
-                        Composite score from <strong>lake area</strong>, <strong>3–5 year growth</strong>,{' '}
+                        Composite score from <strong>lake area</strong>,{' '}
+                        <strong>3–5 year growth (Sentinel-2 NDWI → Sentinel-1 SAR)</strong>,{' '}
                         <strong>elevation</strong>, <strong>glacier proximity</strong>, and{' '}
                         <strong>downstream population</strong>. Lakes are classed as{' '}
                         <span style={{ color: '#2dd48e', fontWeight: 700 }}>Normal</span>,{' '}
                         <span style={{ color: '#38bdf8', fontWeight: 700 }}>Watch</span>,{' '}
                         <span style={{ color: '#f5a524', fontWeight: 700 }}>Warning</span>, or{' '}
                         <span style={{ color: '#f0433a', fontWeight: 700 }}>Critical</span>.
+                        {' '}SAR fills growth when optical summers are too cloudy.
                       </p>
                     </div>
                     {/* Controls pinned top-right (original Flood Monitoring placement) */}
@@ -1948,7 +2272,7 @@ function AppContent() {
                           onChange={(e) => setEwUseGee(e.target.checked)}
                           disabled={ewLoading}
                         />
-                        Include GEE growth + population (slower)
+                        Include GEE growth (S2+SAR) + population (slower)
                       </label>
                       <motion.button
                         className="btn-3d"
@@ -2012,7 +2336,7 @@ function AppContent() {
                     Click <strong style={{ color: pal.accent }}>Run Early Warning Scan</strong> to score all registered lakes.
                     <div style={{ marginTop: 10, fontSize: 12.5 }}>
                       Fast mode always includes elevation, glacier proximity, temperature, flood impact & prediction.
-                      Enable GEE for satellite growth + WorldPop (scanned in small chunks so Render does not time out).
+                      Enable GEE for satellite growth (Sentinel-2 → SAR fallback) + WorldPop (chunked for Render).
                     </div>
                   </div>
                 )}
@@ -2259,7 +2583,7 @@ function AppContent() {
                               </div>
                               <p style={{ margin: '6px 0 8px', fontSize: 13, color: pal.mid }}>{pred.advice}</p>
                               <div style={{ fontSize: 11.5, color: pal.lo }}>
-                                Uses historical growth (if GEE), temperature / melt stress, glacier proximity, lake size, and early-warning score.
+                                Uses historical growth (S2 NDWI with SAR fallback), temperature / melt stress, glacier proximity, lake size, and early-warning score.
                               </div>
                             </div>
                           )}
@@ -2595,21 +2919,21 @@ function AppContent() {
                               </table>
                             </div>
 
-                            {/* Live satellite — same sources as Historical tab */}
+                            {/* Live satellite — optical + SAR (same sources as Historical tab) */}
                             <div style={{ marginTop: 18 }}>
                               <div style={eyebrow}>Live Satellite</div>
                               <h3 style={{ ...sectionTitle, fontSize: 15, marginBottom: 10 }}>
-                                Basin center · NDWI & True Color
+                                Basin center · NDWI, RGB & SAR
                               </h3>
                               <p style={{ margin: '0 0 12px', fontSize: 12, color: pal.lo }}>
-                                Sentinel-2 via GEE at basin center
+                                Sentinel-2 (optical) + Sentinel-1 SAR VV (all-weather) via GEE at basin center
                                 {selected.center ? ` (${selected.center.lat}°N, ${selected.center.lon}°E)` : ''}
                               </p>
-                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14 }}>
+                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 14 }}>
                                 <div style={{ background: pal.panelAlt, borderRadius: 12, padding: 12, border: `1px solid ${pal.border}` }}>
                                   <div style={{ fontSize: 13, fontWeight: 700, color: pal.hi, marginBottom: 8 }}>NDWI / Water Highlight</div>
                                   {basinThumbLoading ? (
-                                    <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
+                                    <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
                                       Loading NDWI…
                                     </div>
                                   ) : basinThumbNdwi ? (
@@ -2619,7 +2943,7 @@ function AppContent() {
                                       style={{ width: '100%', borderRadius: 10, border: `1px solid ${pal.border}`, display: 'block' }}
                                     />
                                   ) : (
-                                    <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo, fontSize: 12.5, textAlign: 'center', padding: 12 }}>
+                                    <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo, fontSize: 12.5, textAlign: 'center', padding: 12 }}>
                                       Image not available (needs GEE auth on server)
                                     </div>
                                   )}
@@ -2627,7 +2951,7 @@ function AppContent() {
                                 <div style={{ background: pal.panelAlt, borderRadius: 12, padding: 12, border: `1px solid ${pal.border}` }}>
                                   <div style={{ fontSize: 13, fontWeight: 700, color: pal.hi, marginBottom: 8 }}>True Color (RGB)</div>
                                   {basinThumbLoading ? (
-                                    <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
+                                    <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
                                       Loading RGB…
                                     </div>
                                   ) : basinThumbRgb ? (
@@ -2637,8 +2961,26 @@ function AppContent() {
                                       style={{ width: '100%', borderRadius: 10, border: `1px solid ${pal.border}`, display: 'block' }}
                                     />
                                   ) : (
-                                    <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo, fontSize: 12.5, textAlign: 'center', padding: 12 }}>
+                                    <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo, fontSize: 12.5, textAlign: 'center', padding: 12 }}>
                                       Image not available (needs GEE auth on server)
+                                    </div>
+                                  )}
+                                </div>
+                                <div style={{ background: pal.panelAlt, borderRadius: 12, padding: 12, border: `1px solid ${pal.border}` }}>
+                                  <div style={{ fontSize: 13, fontWeight: 700, color: pal.hi, marginBottom: 8 }}>SAR VV (cloud-free)</div>
+                                  {basinThumbLoading ? (
+                                    <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>
+                                      Loading SAR…
+                                    </div>
+                                  ) : basinThumbSar ? (
+                                    <img
+                                      src={basinThumbSar}
+                                      alt={`${selected.name} SAR`}
+                                      style={{ width: '100%', borderRadius: 10, border: `1px solid ${pal.border}`, display: 'block' }}
+                                    />
+                                  ) : (
+                                    <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo, fontSize: 12.5, textAlign: 'center', padding: 12 }}>
+                                      SAR not available (needs GEE auth on server)
                                     </div>
                                   )}
                                 </div>
@@ -2651,7 +2993,7 @@ function AppContent() {
                                   background: pal.panelAlt, color: pal.signal, fontWeight: 700, fontSize: 12, cursor: 'pointer'
                                 }}
                               >
-                                {basinThumbLoading ? 'Loading…' : 'Reload satellite images'}
+                                {basinThumbLoading ? 'Loading…' : 'Reload satellite images (S2 + SAR)'}
                               </button>
                             </div>
                           </>
@@ -2869,9 +3211,26 @@ function AppContent() {
         const exp = getRiskExplanation(selectedLake);
         const risk = calculateRisk(selectedLake.area_ha);
         const rc = RISK_COLOR[risk];
-        const detailChartData = (detailHistData?.years || [])
-          .filter(y => y.area_ha != null)
-          .map(y => ({ year: String(y.year), area: y.area_ha }));
+        const detailChartData = (() => {
+          const years = detailHistData?.years || [];
+          const optical = detailHistData?.optical_years || [];
+          const sar = detailHistData?.sar_years || [];
+          const byYear = {};
+          years.forEach((y) => {
+            byYear[y.year] = { year: String(y.year), hybrid: y.area_ha, area: y.area_ha };
+          });
+          optical.forEach((y) => {
+            if (!byYear[y.year]) byYear[y.year] = { year: String(y.year) };
+            byYear[y.year].optical = y.area_ha;
+          });
+          sar.forEach((y) => {
+            if (!byYear[y.year]) byYear[y.year] = { year: String(y.year) };
+            byYear[y.year].sar = y.area_ha;
+          });
+          return Object.values(byYear)
+            .filter((r) => r.hybrid != null || r.optical != null || r.sar != null)
+            .sort((a, b) => Number(a.year) - Number(b.year));
+        })();
         const detailTrendColor =
           detailHistData?.trend === 'growing' ? '#f0433a'
             : detailHistData?.trend === 'shrinking' ? '#2dd48e'
@@ -3039,7 +3398,7 @@ function AppContent() {
                     </div>
                   </div>
                   <p style={{ margin: '10px 0 0', fontSize: 12, color: pal.lo }}>
-                    Data source: Google Earth Engine · Sentinel-2 composites (same as Historical Analysis)
+                    Data source: Google Earth Engine · Sentinel-2 NDWI + Sentinel-1 SAR hybrid (same as Historical Analysis)
                   </p>
                 </div>
 
@@ -3047,7 +3406,7 @@ function AppContent() {
                 <div>
                   <div style={eyebrow}>Time Series</div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
-                    <h3 style={{ ...sectionTitle, fontSize: 16, margin: 0 }}>Surface Area Over Time</h3>
+                    <h3 style={{ ...sectionTitle, fontSize: 16, margin: 0 }}>Surface Area Over Time (S2 + SAR)</h3>
                     <button
                       className="btn-3d"
                       onClick={() => {
@@ -3068,7 +3427,7 @@ function AppContent() {
 
                   {detailHistLoading ? (
                     <div style={{ ...imgBox, height: 220 }}>
-                      Loading historical series from GEE (30–90s)…
+                      Loading hybrid historical series from GEE (S2 + SAR)…
                     </div>
                   ) : detailChartData.length > 0 ? (
                     <div style={{ background: pal.panelAlt, borderRadius: 14, padding: 16, border: `1px solid ${pal.border}` }}>
@@ -3077,15 +3436,11 @@ function AppContent() {
                           <CartesianGrid strokeDasharray="3 3" stroke={pal.border} />
                           <XAxis dataKey="year" tick={{ fill: pal.mid, fontSize: 11 }} />
                           <YAxis tick={{ fill: pal.mid, fontSize: 11 }} unit=" ha" />
-                          <Tooltip contentStyle={chartTooltipStyle} formatter={(v) => [`${v} ha`, 'Area']} />
-                          <Line
-                            type="monotone"
-                            dataKey="area"
-                            stroke="#38bdf8"
-                            strokeWidth={3}
-                            dot={{ r: 4, fill: '#5eead4' }}
-                            activeDot={{ r: 6 }}
-                          />
+                          <Tooltip contentStyle={chartTooltipStyle} formatter={(v, name) => [`${v != null ? v : '—'} ha`, name]} />
+                          <Legend formatter={(value) => <span style={{ color: pal.hi, fontSize: 11 }}>{value}</span>} />
+                          <Line type="monotone" dataKey="hybrid" name="Hybrid" stroke="#5eead4" strokeWidth={3} connectNulls dot={{ r: 3 }} />
+                          <Line type="monotone" dataKey="optical" name="S2" stroke="#38bdf8" strokeWidth={1.5} strokeDasharray="4 3" connectNulls dot={false} />
+                          <Line type="monotone" dataKey="sar" name="SAR" stroke="#fbbf24" strokeWidth={1.5} strokeDasharray="2 2" connectNulls dot={false} />
                         </LineChart>
                       </ResponsiveContainer>
                     </div>
@@ -3103,7 +3458,7 @@ function AppContent() {
                       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                         <thead>
                           <tr style={{ background: pal.panelAlt }}>
-                            {['Year', 'Area (ha)'].map(h => (
+                            {['Year', 'Hybrid', 'S2', 'SAR', 'Sensor'].map(h => (
                               <th key={h} className="mono-label" style={{ padding: '10px 12px', fontSize: 10.5, color: pal.mid, textAlign: 'left' }}>
                                 {h}
                               </th>
@@ -3116,6 +3471,15 @@ function AppContent() {
                               <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: pal.hi }}>{y.year}</td>
                               <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', fontWeight: 700, color: pal.signal }}>
                                 {y.area_ha != null ? y.area_ha : '—'}
+                              </td>
+                              <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: pal.mid }}>
+                                {y.optical_area_ha != null ? y.optical_area_ha : '—'}
+                              </td>
+                              <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', color: '#fbbf24' }}>
+                                {y.sar_area_ha != null ? y.sar_area_ha : '—'}
+                              </td>
+                              <td style={{ padding: '10px 12px', fontSize: 12, color: y.sensor === 'sentinel-1-sar' ? '#fbbf24' : '#38bdf8' }}>
+                                {y.sensor === 'sentinel-1-sar' ? 'SAR' : y.sensor === 'sentinel-2' ? 'Optical' : '—'}
                               </td>
                             </tr>
                           ))}

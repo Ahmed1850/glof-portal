@@ -191,31 +191,39 @@ def fetch_elevation_m(lat: float, lon: float) -> Tuple[Optional[float], Optional
     return None, None
 
 
-def fetch_growth_from_gee(lat: float, lon: float) -> Optional[float]:
+def fetch_growth_from_gee(lat: float, lon: float) -> tuple[Optional[float], Optional[str]]:
     """
-    Percent growth per year from a 2-year Sentinel-2 NDWI pair (one GEE getInfo).
+    Percent growth per year for flood monitoring.
 
-    Previously pulled an 11-year series (~11 getInfo calls) which always timed out
-    on Render free tier when scoring many lakes.
+    Uses Sentinel-2 NDWI first, then Sentinel-1 SAR if optical is cloudy/empty
+    (see estimate_growth_pct_per_year cascade). Returns (growth, source_label).
     """
-    key = _cache_key(lat, lon, "growth", 2019, 2024)
+    key = _cache_key(lat, lon, "growth_meta", 2019, 2024)
     with _CACHE_LOCK:
         item = _GROWTH_CACHE.get(key)
         if item and time.time() - item[0] <= _CACHE_TTL_SEC:
-            return item[1]  # may be None (failed / no water) — still a cache hit
+            cached = item[1]  # (growth, source) or legacy float/None
+            if isinstance(cached, tuple):
+                return cached[0], cached[1]
+            return cached, (
+                "GEE Sentinel-2 NDWI (2-year fast)" if cached is not None else None
+            )
 
     if not GEE_READY and not _init_ee():
-        return None
+        return None, None
     try:
         from app.utils.gee_detection import estimate_growth_pct_per_year
         res = estimate_growth_pct_per_year(lat, lon, year_start=2019, year_end=2024)
         growth = res.get("growth_pct_per_year")
         if growth is not None:
             growth = float(growth)
-        _cache_set(_GROWTH_CACHE, key, growth)
-        return growth
-    except Exception:
-        return None
+        source = res.get("source") or (
+            "GEE growth unavailable" if growth is None else "GEE hybrid growth"
+        )
+        _cache_set(_GROWTH_CACHE, key, (growth, source))
+        return growth, source
+    except Exception as e:
+        return None, f"GEE growth error: {e}"
 
 
 def _population_heuristic(lat: float, lon: float, area_ha: Optional[float]) -> dict:
@@ -320,8 +328,11 @@ def assess_lake(
             elevation_m = fetch_elevation_open_elevation(lat, lon)
             elevation_source = "Open-Elevation" if elevation_m is not None else None
         try:
-            growth = fetch_growth_from_gee(lat, lon)
-            growth_source = "GEE Sentinel-2 NDWI (2-year fast)" if growth is not None else "GEE growth unavailable"
+            growth, growth_source = fetch_growth_from_gee(lat, lon)
+            if growth is not None and not growth_source:
+                growth_source = "GEE Sentinel-2/SAR hybrid growth"
+            elif growth is None and not growth_source:
+                growth_source = "GEE growth unavailable (S2+SAR)"
         except Exception as e:
             growth = None
             growth_source = f"GEE growth error: {e}"
@@ -396,13 +407,16 @@ def assess_lake(
         "data_sources": {
             "elevation": elevation_source,
             "growth": growth_source or (
-                "GEE Sentinel-2 NDWI" if growth is not None else "unavailable (enable GEE scan)"
+                "GEE Sentinel-2 NDWI / Sentinel-1 SAR"
+                if growth is not None
+                else "unavailable (enable GEE scan)"
             ),
             "population": pop.get("source"),
             "glacier": "reference glacier points (GB)",
             "temperature": temp.get("source"),
             "gee_ready": bool(GEE_READY),
             "mode": "gee" if use_gee else "fast",
+            "sensors": ["sentinel-2", "sentinel-1-sar"] if use_gee else [],
         },
     }
 
@@ -420,11 +434,19 @@ def early_warning_status(request: Request):
         ],
         "indicators": [
             {"id": "area", "weight": 25, "label": "Current lake area"},
-            {"id": "growth", "weight": 25, "label": "Area change last 3–5 years"},
+            {
+                "id": "growth",
+                "weight": 25,
+                "label": "Area change last 3–5 years (Sentinel-2 NDWI → Sentinel-1 SAR fallback)",
+            },
             {"id": "elevation", "weight": 15, "label": "Elevation of the lake"},
             {"id": "glacier", "weight": 15, "label": "Proximity to glacier (optional)"},
             {"id": "population", "weight": 20, "label": "Downstream population"},
         ],
+        "sensors": {
+            "optical": "COPERNICUS/S2_SR_HARMONIZED (NDWI)",
+            "sar": "COPERNICUS/S1_GRD (VV, cloud-penetrating)",
+        },
         "gee": gee_status(),
     }
 
@@ -930,7 +952,13 @@ def list_basins(request: Request, db: Session = Depends(get_db)):
             "Downstream storage nodes are valleys, gorges, and plains where outburst water can temporarily pond or route.",
             "Volumes assume mean depth ~12 m (heuristic — not bathymetry).",
             "Use with Flood Monitoring scores for operational prioritisation.",
+            "Satellite views: Sentinel-2 NDWI/RGB + Sentinel-1 SAR VV (all-weather) at each basin centre.",
+            "Growth and historical series fall back to SAR when optical scenes are cloudy.",
         ],
+        "sensors": {
+            "optical": "Sentinel-2 NDWI / RGB",
+            "sar": "Sentinel-1 SAR VV (cloud-penetrating)",
+        },
     }
 
 

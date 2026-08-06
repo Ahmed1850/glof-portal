@@ -119,7 +119,9 @@ One free web service serves **both** the API and the React UI.
 - Lakes inventory (register, rename, bulk, risk scoring)
 - Interactive risk map (Leaflet)
 - Population exposure zones
-- GEE historical area series + NDWI / RGB thumbnails
+- Hybrid historical area series (Sentinel-2 NDWI + Sentinel-1 SAR) + NDWI / RGB / SAR thumbnails
+- Flood monitoring growth uses S2 → SAR fallback when optical is cloudy
+- GLOF basin views include Sentinel-1 SAR VV alongside optical
 - Multi-source satellite detection cascade (GEE → Planetary Computer → SAR → inventory)
 - Dark / light theme + motion UI
 

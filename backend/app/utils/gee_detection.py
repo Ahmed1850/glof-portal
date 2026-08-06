@@ -497,6 +497,76 @@ def estimate_lake_exposure(lat: float, lon: float, risk_level: str = "High") -> 
         }
 
 
+def _growth_from_areas(a0_m2, a1_m2, year_start: int, year_end: int) -> dict:
+    """Shared growth math from two water areas (m²)."""
+    if a0_m2 is None and a1_m2 is None:
+        return {
+            "growth_pct_per_year": None,
+            "year_start": year_start,
+            "year_end": year_end,
+            "error": "No water area for either year",
+        }
+    a0 = float(a0_m2 or 0.0) / 10000.0
+    a1 = float(a1_m2 or 0.0) / 10000.0
+    span = max(1, int(year_end) - int(year_start))
+    if a0 <= 0:
+        growth = 50.0 if a1 > 0 else 0.0
+    else:
+        growth = ((a1 - a0) / a0) * 100.0 / span
+    return {
+        "growth_pct_per_year": round(float(growth), 2),
+        "area_start_ha": round(a0, 2),
+        "area_end_ha": round(a1, 2),
+        "year_start": year_start,
+        "year_end": year_end,
+    }
+
+
+def _s2_summer_water_area_m2(region, year: int):
+    """EE expression: summer Sentinel-2 NDWI water area (m²) for one year."""
+    start = f"{year}-07-01"
+    end = f"{year}-09-30"
+    s2 = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(region)
+        .filterDate(start, end)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 40))
+        .median()
+    )
+    ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI")
+    water = ndwi.gt(0.2).selfMask()
+    return water.multiply(ee.Image.pixelArea()).reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=region,
+        scale=30,
+        maxPixels=1e7,
+        bestEffort=True,
+    ).get("NDWI")
+
+
+def _sar_summer_water_area_m2(region, year: int, vv_threshold_db: float = -16.0):
+    """EE expression: summer Sentinel-1 VV water area (m²) for one year (cloud-free)."""
+    start = f"{year}-07-01"
+    end = f"{year}-09-30"
+    s1 = (
+        ee.ImageCollection("COPERNICUS/S1_GRD")
+        .filterBounds(region)
+        .filterDate(start, end)
+        .filter(ee.Filter.eq("instrumentMode", "IW"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+        .select("VV")
+        .median()
+    )
+    water = s1.lt(vv_threshold_db).selfMask()
+    return water.multiply(ee.Image.pixelArea()).reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=region,
+        scale=40,
+        maxPixels=1e7,
+        bestEffort=True,
+    ).get("VV")
+
+
 @_require_ee
 def estimate_growth_pct_per_year(
     lat: float,
@@ -506,10 +576,11 @@ def estimate_growth_pct_per_year(
     buffer_m: float = 1200,
 ) -> dict:
     """
-    Fast growth rate for early-warning: two summer seasons in ONE getInfo().
+    Fast growth rate for early-warning / flood monitoring.
 
-    Full 11-year historical series is still available via get_historical_areas()
-    for the Historical tab — this is only for board scoring under Render timeouts.
+    Cascade (one or two getInfo calls):
+      1) Sentinel-2 NDWI summer pair
+      2) Sentinel-1 SAR VV pair if optical fails / no water (cloudy monsoons)
     """
     if lat is None or lon is None:
         return {"growth_pct_per_year": None, "error": "Missing coordinates"}
@@ -518,111 +589,104 @@ def estimate_growth_pct_per_year(
         point = ee.Geometry.Point([lon, lat])
         region = point.buffer(buffer_m)
 
-        def _summer_water_area_m2(year: int):
-            start = f"{year}-07-01"
-            end = f"{year}-09-30"
-            s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-                  .filterBounds(region)
-                  .filterDate(start, end)
-                  .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 40))
-                  .median())
-            ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI")
-            water = ndwi.gt(0.2).selfMask()
-            return water.multiply(ee.Image.pixelArea()).reduceRegion(
-                reducer=ee.Reducer.sum(),
-                geometry=region,
-                scale=30,  # slightly coarser than 20m → much faster on free hosts
-                maxPixels=1e7,
-                bestEffort=True,
-            ).get("NDWI")
-
-        stats = ee.Dictionary({
-            "a0": _summer_water_area_m2(year_start),
-            "a1": _summer_water_area_m2(year_end),
-            "y0": year_start,
-            "y1": year_end,
+        # Optical first
+        s2_stats = ee.Dictionary({
+            "a0": _s2_summer_water_area_m2(region, year_start),
+            "a1": _s2_summer_water_area_m2(region, year_end),
         }).getInfo()
+        s2_result = _growth_from_areas(
+            s2_stats.get("a0"), s2_stats.get("a1"), year_start, year_end
+        )
+        if s2_result.get("growth_pct_per_year") is not None and not s2_result.get("error"):
+            # Prefer S2 when at least one year has measurable water
+            a0 = s2_result.get("area_start_ha") or 0
+            a1 = s2_result.get("area_end_ha") or 0
+            if a0 > 0 or a1 > 0:
+                s2_result["source"] = "GEE Sentinel-2 NDWI (2-year fast growth)"
+                s2_result["sensor"] = "sentinel-2"
+                return s2_result
 
-        a0_m2 = stats.get("a0")
-        a1_m2 = stats.get("a1")
-        if a0_m2 is None and a1_m2 is None:
-            return {
-                "growth_pct_per_year": None,
-                "year_start": year_start,
-                "year_end": year_end,
-                "error": "No water area for either year",
-            }
+        # SAR fallback (penetrates clouds)
+        s1_stats = ee.Dictionary({
+            "a0": _sar_summer_water_area_m2(region, year_start),
+            "a1": _sar_summer_water_area_m2(region, year_end),
+        }).getInfo()
+        s1_result = _growth_from_areas(
+            s1_stats.get("a0"), s1_stats.get("a1"), year_start, year_end
+        )
+        if s1_result.get("growth_pct_per_year") is not None and not s1_result.get("error"):
+            s1_result["source"] = "GEE Sentinel-1 SAR (2-year fast growth, cloud-free)"
+            s1_result["sensor"] = "sentinel-1-sar"
+            s1_result["optical_fallback"] = True
+            return s1_result
 
-        a0 = float(a0_m2 or 0.0) / 10000.0
-        a1 = float(a1_m2 or 0.0) / 10000.0
-        span = max(1, int(year_end) - int(year_start))
-
-        if a0 <= 0:
-            growth = 50.0 if a1 > 0 else 0.0
-        else:
-            growth = ((a1 - a0) / a0) * 100.0 / span
-
-        return {
-            "growth_pct_per_year": round(float(growth), 2),
-            "area_start_ha": round(a0, 2),
-            "area_end_ha": round(a1, 2),
-            "year_start": year_start,
-            "year_end": year_end,
-            "source": "GEE Sentinel-2 NDWI (2-year fast growth)",
-        }
+        # Both failed — return optical error if any
+        out = s2_result if s2_result.get("error") else s1_result
+        out["source"] = "GEE optical+SAR growth unavailable"
+        out["sensor"] = None
+        return out
     except Exception as e:
         return {
             "growth_pct_per_year": None,
             "year_start": year_start,
             "year_end": year_end,
             "error": str(e),
+            "sensor": None,
         }
 
 
-# ==================== HISTORICAL AREA (Sentinel-2 NDWI) ====================
+# ==================== HISTORICAL AREA (S2 NDWI + S1 SAR) ====================
 @_require_ee
 def estimate_area_for_year(lat: float, lon: float, year: int, buffer_m: float = 1500) -> dict:
     """
-    Estimate water area (ha) around a lake point for one summer season.
-    Uses Sentinel-2 NDWI median composite for July–September of that year.
+    Estimate water area (ha) for one summer season.
+    Prefer Sentinel-2 NDWI; fall back to Sentinel-1 SAR if optical is empty/fails.
     """
     try:
         point = ee.Geometry.Point([lon, lat])
         region = point.buffer(buffer_m)
 
-        start = f"{year}-07-01"
-        end = f"{year}-09-30"
+        stats = ee.Dictionary({
+            "s2": _s2_summer_water_area_m2(region, year),
+            "s1": _sar_summer_water_area_m2(region, year),
+        }).getInfo()
 
-        s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-              .filterBounds(region)
-              .filterDate(start, end)
-              .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 30))
-              .median())
+        s2_m2 = stats.get("s2")
+        s1_m2 = stats.get("s1")
+        s2_ha = round(float(s2_m2) / 10000.0, 2) if s2_m2 is not None else None
+        s1_ha = round(float(s1_m2) / 10000.0, 2) if s1_m2 is not None else None
 
-        ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI")
-        water = ndwi.gt(0.2).selfMask()
-
-        # Pixel area in m², then convert to hectares
-        pixel_area = ee.Image.pixelArea()
-        water_area_m2 = water.multiply(pixel_area).reduceRegion(
-            reducer=ee.Reducer.sum(),
-            geometry=region,
-            scale=20,
-            maxPixels=1e8
-        ).get("NDWI")
-
-        area_m2 = ee.Number(water_area_m2).getInfo()
-        if area_m2 is None:
-            area_m2 = 0
-
-        area_ha = round(float(area_m2) / 10000.0, 2)
-
+        if s2_ha is not None and s2_ha > 0:
+            return {
+                "year": year,
+                "area_ha": s2_ha,
+                "optical_area_ha": s2_ha,
+                "sar_area_ha": s1_ha,
+                "latitude": lat,
+                "longitude": lon,
+                "sensor": "sentinel-2",
+                "source": "GEE Sentinel-2 NDWI",
+            }
+        if s1_ha is not None:
+            return {
+                "year": year,
+                "area_ha": s1_ha,
+                "optical_area_ha": s2_ha,
+                "sar_area_ha": s1_ha,
+                "latitude": lat,
+                "longitude": lon,
+                "sensor": "sentinel-1-sar",
+                "source": "GEE Sentinel-1 SAR (optical cloudy/empty)",
+            }
         return {
             "year": year,
-            "area_ha": area_ha,
+            "area_ha": s2_ha if s2_ha is not None else 0,
+            "optical_area_ha": s2_ha,
+            "sar_area_ha": s1_ha,
             "latitude": lat,
             "longitude": lon,
-            "source": "GEE Sentinel-2 NDWI"
+            "sensor": "sentinel-2",
+            "source": "GEE Sentinel-2 NDWI",
         }
     except Exception as e:
         return {
@@ -630,39 +694,132 @@ def estimate_area_for_year(lat: float, lon: float, year: int, buffer_m: float = 
             "area_ha": None,
             "latitude": lat,
             "longitude": lon,
-            "error": str(e)
+            "error": str(e),
         }
+
+
+def _series_trend(series: list) -> str:
+    valid = [s for s in series if s.get("area_ha") is not None]
+    if len(valid) < 2:
+        return "unknown"
+    first = valid[0]["area_ha"]
+    last = valid[-1]["area_ha"]
+    if last > first * 1.1:
+        return "growing"
+    if last < first * 0.9:
+        return "shrinking"
+    return "stable"
+
 
 @_require_ee
 def get_historical_areas(lat: float, lon: float, years=None) -> dict:
     """
-    Get estimated area for consecutive years (2015–2025 = 11 years)
+    Multi-year lake area series with dual sensors (batched getInfo for Render).
+
+    - optical_years: Sentinel-2 NDWI summer composites
+    - sar_years: Sentinel-1 SAR VV water (cloud-penetrating)
+    - years: hybrid preferred series (S2 when water detected, else SAR)
     """
     if years is None:
-        years = list(range(2015, 2026))   # 2015, 2016, 2017, ..., 2025
+        years = list(range(2015, 2026))
 
-    series = []
+    point = ee.Geometry.Point([lon, lat])
+    region = point.buffer(1500)
+
+    # Two batched round-trips instead of 11×2 sequential getInfo calls
+    optical_expr = {f"y{y}": _s2_summer_water_area_m2(region, y) for y in years}
+    sar_expr = {f"y{y}": _sar_summer_water_area_m2(region, y) for y in years}
+
+    try:
+        optical_raw = ee.Dictionary(optical_expr).getInfo() or {}
+    except Exception as e:
+        optical_raw = {"_error": str(e)}
+    try:
+        sar_raw = ee.Dictionary(sar_expr).getInfo() or {}
+    except Exception as e:
+        sar_raw = {"_error": str(e)}
+
+    optical_years = []
+    sar_years = []
+    hybrid = []
+
     for y in years:
-        series.append(estimate_area_for_year(lat, lon, y))
+        key = f"y{y}"
+        o_m2 = optical_raw.get(key) if "_error" not in optical_raw else None
+        s_m2 = sar_raw.get(key) if "_error" not in sar_raw else None
 
-    valid = [s for s in series if s.get("area_ha") is not None]
-    trend = "unknown"
-    if len(valid) >= 2:
-        first = valid[0]["area_ha"]
-        last = valid[-1]["area_ha"]
-        if last > first * 1.1:
-            trend = "growing"
-        elif last < first * 0.9:
-            trend = "shrinking"
+        o_ha = round(float(o_m2) / 10000.0, 2) if o_m2 is not None else None
+        s_ha = round(float(s_m2) / 10000.0, 2) if s_m2 is not None else None
+
+        optical_years.append({
+            "year": y,
+            "area_ha": o_ha,
+            "latitude": lat,
+            "longitude": lon,
+            "sensor": "sentinel-2",
+            "source": "GEE Sentinel-2 NDWI",
+            **({"error": optical_raw["_error"]} if "_error" in optical_raw else {}),
+        })
+        sar_years.append({
+            "year": y,
+            "area_ha": s_ha,
+            "latitude": lat,
+            "longitude": lon,
+            "sensor": "sentinel-1-sar",
+            "source": "GEE Sentinel-1 SAR",
+            **({"error": sar_raw["_error"]} if "_error" in sar_raw else {}),
+        })
+
+        if o_ha is not None and o_ha > 0:
+            hybrid.append({
+                "year": y,
+                "area_ha": o_ha,
+                "optical_area_ha": o_ha,
+                "sar_area_ha": s_ha,
+                "latitude": lat,
+                "longitude": lon,
+                "sensor": "sentinel-2",
+                "source": "GEE Sentinel-2 NDWI",
+            })
+        elif s_ha is not None:
+            hybrid.append({
+                "year": y,
+                "area_ha": s_ha,
+                "optical_area_ha": o_ha,
+                "sar_area_ha": s_ha,
+                "latitude": lat,
+                "longitude": lon,
+                "sensor": "sentinel-1-sar",
+                "source": "GEE Sentinel-1 SAR (optical cloudy/empty)",
+            })
         else:
-            trend = "stable"
+            hybrid.append({
+                "year": y,
+                "area_ha": o_ha if o_ha is not None else s_ha,
+                "optical_area_ha": o_ha,
+                "sar_area_ha": s_ha,
+                "latitude": lat,
+                "longitude": lon,
+                "sensor": "sentinel-2" if o_ha is not None else ("sentinel-1-sar" if s_ha is not None else None),
+                "source": "GEE hybrid (no water detected)",
+            })
 
     return {
         "latitude": lat,
         "longitude": lon,
-        "years": series,
-        "trend": trend,
-        "source": "GEE Sentinel-2 NDWI (summer composites)"
+        "years": hybrid,
+        "optical_years": optical_years,
+        "sar_years": sar_years,
+        "trend": _series_trend(hybrid),
+        "optical_trend": _series_trend(optical_years),
+        "sar_trend": _series_trend(sar_years),
+        "source": "GEE hybrid Sentinel-2 NDWI + Sentinel-1 SAR",
+        "sensors": ["sentinel-2", "sentinel-1-sar"],
+        "notes": [
+            "Primary series prefers Sentinel-2 NDWI when water is detected.",
+            "Sentinel-1 SAR fills cloudy monsoon summers (all-weather).",
+            "SAR VV threshold ≈ −16 dB; areas are planning-grade, not survey-grade.",
+        ],
     }
 
 
@@ -672,52 +829,88 @@ def get_lake_thumbnail(lat: float, lon: float, buffer_m: float = 2000, mode: str
     """
     Generate a live thumbnail URL around the lake.
     mode:
-      - 'rgb'  → true-color
-      - 'ndwi' → water-highlighted (blue water)
+      - 'rgb'  → true-color (Sentinel-2)
+      - 'ndwi' → water-highlighted (Sentinel-2)
+      - 'sar'  → Sentinel-1 VV backscatter (cloud-penetrating)
     """
     try:
         point = ee.Geometry.Point([lon, lat])
         region = point.buffer(buffer_m)
+        mode_l = (mode or "ndwi").lower()
 
-        s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-              .filterBounds(region)
-              .filterDate("2024-07-01", "2024-09-30")
-              .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-              .median()
-              .clip(region))
+        if mode_l == "sar":
+            from datetime import datetime, timedelta, timezone
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(days=90)
+            s1 = (
+                ee.ImageCollection("COPERNICUS/S1_GRD")
+                .filterBounds(region)
+                .filterDate(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+                .filter(ee.Filter.eq("instrumentMode", "IW"))
+                .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+                .select("VV")
+                .median()
+                .clip(region)
+            )
+            vis = {
+                "min": -25,
+                "max": 0,
+                "palette": ["#0a1628", "#1e3a5f", "#38bdf8", "#f8fafc", "#fbbf24"],
+                "dimensions": 512,
+                "region": region,
+                "format": "png",
+            }
+            url = s1.getThumbURL(vis)
+            return {
+                "latitude": lat,
+                "longitude": lon,
+                "mode": "sar",
+                "url": url,
+                "source": "GEE Sentinel-1 SAR VV",
+            }
 
-        if mode == "rgb":
+        date_start, date_end = _s2_date_window(summer_only=True)
+        s2 = (
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            .filterBounds(region)
+            .filterDate(date_start, date_end)
+            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+            .median()
+            .clip(region)
+        )
+
+        if mode_l == "rgb":
             vis = {
                 "bands": ["B4", "B3", "B2"],
                 "min": 0,
                 "max": 3000,
                 "dimensions": 512,
                 "region": region,
-                "format": "png"
+                "format": "png",
             }
             image = s2
+            source = "GEE Sentinel-2 RGB"
         else:
-            # NDWI false-color style (water bright)
             ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI")
-            # Visualize NDWI: water = cyan/blue
             vis = {
                 "min": -0.3,
                 "max": 0.5,
                 "palette": ["#0c1826", "#1e3a5f", "#38bdf8", "#5eead4", "#ffffff"],
                 "dimensions": 512,
                 "region": region,
-                "format": "png"
+                "format": "png",
             }
             image = ndwi
+            source = "GEE Sentinel-2 NDWI"
 
         url = image.getThumbURL(vis)
 
         return {
             "latitude": lat,
             "longitude": lon,
-            "mode": mode,
+            "mode": mode_l,
             "url": url,
-            "source": "GEE Sentinel-2"
+            "source": source,
         }
     except Exception as e:
         return {
@@ -725,5 +918,5 @@ def get_lake_thumbnail(lat: float, lon: float, buffer_m: float = 2000, mode: str
             "longitude": lon,
             "mode": mode,
             "url": None,
-            "error": str(e)
+            "error": str(e),
         }

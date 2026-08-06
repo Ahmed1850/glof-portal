@@ -107,8 +107,9 @@ def historical_area(
     lon: float = Query(...)
 ):
     """
-    Estimate lake area for years 2015, 2017, 2019, 2021, 2023, 2025
-    using Sentinel-2 NDWI summer composites.
+    Hybrid historical lake area (2015–2025):
+      - Sentinel-2 NDWI summer composites (optical)
+      - Sentinel-1 SAR VV (cloud-penetrating fallback / dual series)
     Example: /gee/historical?lat=36.318&lon=74.865
     """
     try:
@@ -123,14 +124,15 @@ def lake_thumbnail(
     request: Request,
     lat: float = Query(...),
     lon: float = Query(...),
-    mode: str = Query("ndwi", pattern="^(rgb|ndwi)$"),
+    mode: str = Query("ndwi", pattern="^(rgb|ndwi|sar)$"),
     buffer_m: float = Query(2000, ge=500, le=50000),
 ):
     """
     Live satellite thumbnail around the lake.
-    mode=rgb  → true color
-    mode=ndwi → water-highlighted
-    Example: /gee/thumbnail?lat=36.318&lon=74.865&mode=ndwi
+    mode=rgb  → Sentinel-2 true color
+    mode=ndwi → Sentinel-2 water highlight
+    mode=sar  → Sentinel-1 VV backscatter (all-weather)
+    Example: /gee/thumbnail?lat=36.318&lon=74.865&mode=sar
     """
     try:
         result = get_lake_thumbnail(lat, lon, buffer_m=buffer_m, mode=mode)
@@ -149,7 +151,7 @@ def lake_thumbnail_image(
     request: Request,
     lat: float = Query(...),
     lon: float = Query(...),
-    mode: str = Query("ndwi", pattern="^(rgb|ndwi)$"),
+    mode: str = Query("ndwi", pattern="^(rgb|ndwi|sar)$"),
     buffer_m: float = Query(8000, ge=500, le=50000),
 ):
     """
@@ -173,12 +175,13 @@ def lake_thumbnail_image(
         with urllib.request.urlopen(req, timeout=90) as resp:
             data = resp.read()
             content_type = resp.headers.get("Content-Type", "image/png")
+        sensor = "Sentinel-1-SAR" if (mode or "").lower() == "sar" else "Sentinel-2"
         return Response(
             content=data,
             media_type=content_type,
             headers={
                 "Cache-Control": "public, max-age=600",
-                "X-GEE-Source": "Sentinel-2",
+                "X-GEE-Source": sensor,
             },
         )
     except HTTPException:
