@@ -19,9 +19,16 @@ Glacial Lake Outburst Flood (GLOF) monitoring portal for Gilgit-Baltistan — Fa
 
 | Resource | URL |
 |----------|-----|
-| **GEE status** | https://glof-portal.onrender.com/gee/status |
+| **GEE / cascade status** | https://glof-portal.onrender.com/gee/status |
 
-Satellite Detection, Population Exposure, Historical area, and live thumbnails need **Google Earth Engine service-account credentials** on Render. Without them the rest of the portal works, but GEE routes return `503`.
+**Lake detection cascade** (`GET /gee/detect-lakes`):
+
+1. **Google Earth Engine** — Sentinel-2 NDWI (primary)
+2. **Microsoft Planetary Computer** — Sentinel-2 (if GEE fails or high clouds)
+3. **Sentinel-1 SAR** — cloud-penetrating (via GEE when available)
+4. **Database + Known Lakes Inventory** — offline fallback
+
+Population Exposure, Historical area, and live thumbnails still need **Google Earth Engine service-account credentials** on Render. Without them those routes return `503`, but detection still falls through to Planetary Computer / inventory.
 
 #### Enable GEE on Render (one-time)
 
@@ -113,7 +120,7 @@ One free web service serves **both** the API and the React UI.
 - Interactive risk map (Leaflet)
 - Population exposure zones
 - GEE historical area series + NDWI / RGB thumbnails
-- Satellite detection endpoint
+- Multi-source satellite detection cascade (GEE → Planetary Computer → SAR → inventory)
 - Dark / light theme + motion UI
 
 ## License

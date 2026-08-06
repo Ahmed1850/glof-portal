@@ -115,25 +115,115 @@ def _require_ee(fn):
     return wrapper
 
 
+def _s2_date_window(summer_only: bool = True) -> tuple[str, str]:
+    """Rolling window for optical composites (prefer recent summer if possible)."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    year = now.year
+    # Prefer current-year summer; if before July, use previous year
+    if summer_only:
+        if now.month < 7:
+            year = year - 1
+        return f"{year}-07-01", f"{year}-09-30"
+    # Last ~120 days
+    from datetime import timedelta
+    end = now
+    start = end - timedelta(days=120)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+
+def _features_to_lake_list(features: list, source: str, name_prefix: str = "GLOF Lake") -> list:
+    results = []
+    for i, feature in enumerate(features, 1):
+        props = feature.get("properties") or {}
+        geom = feature.get("geometry") or {}
+        try:
+            coords = geom.get("coordinates") or []
+            ring = coords[0] if geom.get("type") == "Polygon" and coords else None
+            if ring:
+                lons = [c[0] for c in ring]
+                lats = [c[1] for c in ring]
+                centroid_lon = sum(lons) / len(lons)
+                centroid_lat = sum(lats) / len(lats)
+            else:
+                centroid_lon = centroid_lat = None
+        except Exception:
+            centroid_lon = centroid_lat = None
+
+        area_ha = props.get("area_ha", 0) or 0
+        results.append({
+            "name": f"{name_prefix} {i}",
+            "area_ha": round(float(area_ha), 2),
+            "latitude": round(centroid_lat, 5) if centroid_lat is not None else None,
+            "longitude": round(centroid_lon, 5) if centroid_lon is not None else None,
+            "source": source,
+        })
+
+    results = [r for r in results if r.get("latitude") is not None]
+    results = sorted(results, key=lambda x: x["area_ha"], reverse=True)
+    for i, lake in enumerate(results, 1):
+        lake["name"] = f"{name_prefix} {i}"
+    return results
+
+
 @_require_ee
-def detect_glacial_lakes():
+def detect_glacial_lakes_s2_detailed(
+    max_cloud_pct: float = 30.0,
+    cloud_filter: float = 40.0,
+    min_area_ha: float = 8.0,
+    limit: int = 25,
+) -> dict:
     """
-    Improved detection of glacial lakes in high-elevation areas of Gilgit-Baltistan
-    using Sentinel-2 NDWI + elevation filter.
+    Sentinel-2 NDWI detection with cloud diagnostics for the cascade.
+
+    Returns:
+      ok, lakes, cloudy, mean_cloud_pct, scene_count, detail, ...
     """
+    date_start, date_end = _s2_date_window(summer_only=True)
     roi = ee.Geometry.Rectangle([73.5, 35.2, 76.8, 37.2])
-    elevation = ee.Image('USGS/SRTMGL1_003').select('elevation')
+    elevation = ee.Image("USGS/SRTMGL1_003").select("elevation")
 
-    s2 = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-          .filterBounds(roi)
-          .filterDate('2024-07-01', '2024-09-15')
-          .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 15))
-          .median()
-          .clip(roi))
+    collection = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(roi)
+        .filterDate(date_start, date_end)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_filter))
+    )
 
-    green = s2.select('B3')
-    nir = s2.select('B8')
-    ndwi = green.subtract(nir).divide(green.add(nir)).rename('NDWI')
+    # Cloud + count diagnostics in one server round-trip where possible
+    scene_count = collection.size()
+    mean_cloud = collection.aggregate_mean("CLOUDY_PIXEL_PERCENTAGE")
+    stats = ee.Dictionary({
+        "scene_count": scene_count,
+        "mean_cloud": mean_cloud,
+    }).getInfo()
+
+    n_scenes = int(stats.get("scene_count") or 0)
+    mean_cloud_val = stats.get("mean_cloud")
+    try:
+        mean_cloud_val = float(mean_cloud_val) if mean_cloud_val is not None else None
+    except (TypeError, ValueError):
+        mean_cloud_val = None
+
+    if n_scenes == 0:
+        return {
+            "ok": False,
+            "lakes": [],
+            "cloudy": True,
+            "mean_cloud_pct": None,
+            "scene_count": 0,
+            "date_start": date_start,
+            "date_end": date_end,
+            "detail": f"No Sentinel-2 scenes under {cloud_filter}% cloud for {date_start}→{date_end}",
+        }
+
+    cloudy = mean_cloud_val is not None and mean_cloud_val > max_cloud_pct
+
+    s2 = collection.median().clip(roi)
+    green = s2.select("B3")
+    nir = s2.select("B8")
+    ndwi = green.subtract(nir).divide(green.add(nir)).rename("NDWI")
 
     water = ndwi.gt(0.25)
     high_elevation = elevation.gt(3200)
@@ -142,78 +232,142 @@ def detect_glacial_lakes():
     vectors = glacial_water.selfMask().reduceToVectors(
         geometry=roi,
         scale=30,
-        geometryType='polygon',
+        geometryType="polygon",
         eightConnected=False,
-        labelProperty='water',
-        maxPixels=1e10
+        labelProperty="water",
+        maxPixels=1e10,
     )
 
     def add_area(feature):
         area_ha = feature.geometry().area(maxError=1).divide(10000)
-        return feature.set({'area_ha': area_ha})
+        return feature.set({"area_ha": area_ha})
 
     vectors = vectors.map(add_area)
-    significant = vectors.filter(ee.Filter.gt('area_ha', 8))
-    lakes_info = significant.limit(25).getInfo()
+    significant = vectors.filter(ee.Filter.gt("area_ha", min_area_ha))
+    lakes_info = significant.limit(limit).getInfo()
+    lakes = _features_to_lake_list(
+        lakes_info.get("features", []),
+        source="GEE Sentinel-2 NDWI + Elevation Filter",
+        name_prefix="GLOF Lake",
+    )
 
-    results = []
-    for i, feature in enumerate(lakes_info.get('features', []), 1):
-        props = feature['properties']
-        geom = feature['geometry']
-        try:
-            coords = geom['coordinates'][0]
-            lons = [c[0] for c in coords]
-            lats = [c[1] for c in coords]
-            centroid_lon = sum(lons) / len(lons)
-            centroid_lat = sum(lats) / len(lats)
-        except Exception:
-            centroid_lon = None
-            centroid_lat = None
+    if cloudy:
+        return {
+            "ok": False,
+            "lakes": lakes,
+            "cloudy": True,
+            "mean_cloud_pct": round(mean_cloud_val, 2) if mean_cloud_val is not None else None,
+            "scene_count": n_scenes,
+            "date_start": date_start,
+            "date_end": date_end,
+            "detail": (
+                f"High cloud cover on GEE Sentinel-2 "
+                f"(mean {mean_cloud_val:.1f}% > {max_cloud_pct}%)"
+            ),
+        }
 
-        results.append({
-            "name": f"GLOF Lake {i}",
-            "area_ha": round(props.get('area_ha', 0), 2),
-            "latitude": round(centroid_lat, 5) if centroid_lat else None,
-            "longitude": round(centroid_lon, 5) if centroid_lon else None,
-            "source": "GEE Sentinel-2 NDWI + Elevation Filter"
-        })
+    if not lakes:
+        return {
+            "ok": False,
+            "lakes": [],
+            "cloudy": False,
+            "mean_cloud_pct": round(mean_cloud_val, 2) if mean_cloud_val is not None else None,
+            "scene_count": n_scenes,
+            "date_start": date_start,
+            "date_end": date_end,
+            "detail": "GEE Sentinel-2 composite OK but no lakes above area threshold",
+        }
 
-    results = sorted(results, key=lambda x: x['area_ha'], reverse=True)
-    for i, lake in enumerate(results, 1):
-        lake['name'] = f"GLOF Lake {i}"
-    return results
+    return {
+        "ok": True,
+        "lakes": lakes,
+        "cloudy": False,
+        "mean_cloud_pct": round(mean_cloud_val, 2) if mean_cloud_val is not None else None,
+        "scene_count": n_scenes,
+        "date_start": date_start,
+        "date_end": date_end,
+        "detail": f"Detected {len(lakes)} lakes from {n_scenes} S2 scenes",
+    }
 
 
 @_require_ee
-def detect_glacial_lakes_sar():
+def detect_glacial_lakes():
     """
-    Detect glacial lakes using Sentinel-1 SAR data (can see through clouds).
+    Backward-compatible lake list from GEE Sentinel-2.
+    Prefer detect_lakes_cascade() for production multi-source flow.
     """
+    result = detect_glacial_lakes_s2_detailed()
+    return result.get("lakes") or []
+
+
+@_require_ee
+def detect_glacial_lakes_sar(
+    min_area_ha: float = 8.0,
+    limit: int = 25,
+    vv_threshold_db: float = -16.0,
+) -> dict:
+    """
+    Detect glacial lakes using Sentinel-1 SAR (sees through clouds).
+
+    Returns the same lake dict shape as optical detection, plus ok/detail meta.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=90)
+    date_start = start.strftime("%Y-%m-%d")
+    date_end = end.strftime("%Y-%m-%d")
+
     roi = ee.Geometry.Rectangle([73.5, 35.2, 76.8, 37.2])
-    
-    # Filter SAR collection
-    s1 = (ee.ImageCollection('COPERNICUS/S1_GRD')
-          .filterBounds(roi)
-          .filterDate('2024-07-01', '2024-09-30')
-          .filter(ee.Filter.eq('instrumentMode', 'IW'))
-          .select('VV')
-          .median()
-          .clip(roi))
-    
-    # SAR water detection (low backscatter)
-    water = s1.lt(-16) # Thresholding for water
-    
-    vectors = water.selfMask().reduceToVectors(
-        geometry=roi,
-        scale=30,
-        geometryType='polygon',
-        eightConnected=False,
-        maxPixels=1e10
+    elevation = ee.Image("USGS/SRTMGL1_003").select("elevation")
+
+    s1 = (
+        ee.ImageCollection("COPERNICUS/S1_GRD")
+        .filterBounds(roi)
+        .filterDate(date_start, date_end)
+        .filter(ee.Filter.eq("instrumentMode", "IW"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+        .select("VV")
+        .median()
+        .clip(roi)
     )
-    
-    # Simple vector processing
-    lakes_info = vectors.limit(25).getInfo()
-    return {"message": "SAR detection functionality added", "features": lakes_info.get('features', [])}
+
+    # SAR water detection (low VV backscatter) + high elevation glacial filter
+    water = s1.lt(vv_threshold_db)
+    glacial_water = water.And(elevation.gt(3200))
+
+    vectors = glacial_water.selfMask().reduceToVectors(
+        geometry=roi,
+        scale=40,
+        geometryType="polygon",
+        eightConnected=False,
+        maxPixels=1e10,
+    )
+
+    def add_area(feature):
+        area_ha = feature.geometry().area(maxError=1).divide(10000)
+        return feature.set({"area_ha": area_ha})
+
+    vectors = vectors.map(add_area)
+    significant = vectors.filter(ee.Filter.gt("area_ha", min_area_ha))
+    lakes_info = significant.limit(limit).getInfo()
+    features = lakes_info.get("features", [])
+    lakes = _features_to_lake_list(
+        features,
+        source="GEE Sentinel-1 SAR",
+        name_prefix="SAR Lake",
+    )
+
+    return {
+        "ok": len(lakes) > 0,
+        "lakes": lakes,
+        "features": features,
+        "message": f"SAR detection completed ({len(lakes)} water bodies)",
+        "detail": f"Sentinel-1 IW VV median {date_start}→{date_end}",
+        "date_start": date_start,
+        "date_end": date_end,
+        "source": "GEE Sentinel-1 SAR",
+    }
 
 
 @_require_ee

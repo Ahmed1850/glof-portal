@@ -1,16 +1,19 @@
 # app/api/routers/gee.py
 
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from sqlalchemy.orm import Session
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+
+from app.db.session import get_db
 from app.utils.gee_detection import (
-    detect_glacial_lakes,
     estimate_population,
     estimate_lake_exposure,
     get_historical_areas,
     get_lake_thumbnail,
     gee_status,
 )
+from app.services.satellite_cascade import detect_lakes_cascade, cascade_status
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -29,20 +32,34 @@ def _gee_http_error(e: Exception) -> HTTPException:
 @router.get("/status")
 @limiter.limit("60/minute")
 def status(request: Request):
-    """Check whether GEE is authenticated on this server."""
-    return gee_status()
+    """
+    GEE auth + multi-source cascade health:
+      1) GEE Sentinel-2
+      2) Planetary Computer Sentinel-2
+      3) Sentinel-1 SAR
+      4) Database inventory
+    """
+    try:
+        return cascade_status()
+    except Exception:
+        # Never break status endpoint
+        return {"gee": gee_status(), "cascade": [], "error": "cascade status partial"}
 
 
 @router.get("/detect-lakes")
 @limiter.limit("3/minute")
-def detect_lakes(request: Request):
+def detect_lakes(request: Request, db: Session = Depends(get_db)):
+    """
+    Multi-source glacial lake detection cascade:
+
+      1. Google Earth Engine (Sentinel-2 NDWI)
+      2. Microsoft Planetary Computer (Sentinel-2) — if GEE fails / high clouds
+      3. Sentinel-1 SAR — if optical still cloudy
+      4. Database + Known Lakes Inventory — offline fallback
+    """
     try:
-        lakes = detect_glacial_lakes()
-        return {
-            "message": "Detection completed successfully",
-            "total_detected": len(lakes),
-            "lakes": lakes
-        }
+        result = detect_lakes_cascade(db=db)
+        return result
     except Exception as e:
         raise _gee_http_error(e)
 
@@ -139,9 +156,8 @@ def lake_thumbnail_image(
     Proxy GEE thumbnail as a real PNG so browsers can display it in <img src>.
     Earth Engine v1 thumb URLs sometimes fail as direct image sources in the browser.
     """
-    import io
     import urllib.request
-    from fastapi.responses import Response, StreamingResponse
+    from fastapi.responses import Response
 
     try:
         result = get_lake_thumbnail(lat, lon, buffer_m=buffer_m, mode=mode)

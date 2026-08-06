@@ -133,6 +133,7 @@ function AppContent() {
   const [detecting, setDetecting] = useState(false);
   const [detectedLakes, setDetectedLakes] = useState([]);
   const [lastGEEResults, setLastGEEResults] = useState([]);
+  const [detectionMeta, setDetectionMeta] = useState(null); // cascade source + attempts
   const [saving, setSaving] = useState(false);
   const [satelliteRisk, setSatelliteRisk] = useState('All');
 
@@ -540,11 +541,20 @@ function AppContent() {
 
   const handleDetectLakes = async () => {
     setDetecting(true);
+    setDetectionMeta(null);
     try {
       const res = await axios.get(`${API_BASE}/gee/detect-lakes`);
       const data = res.data.lakes || [];
       setDetectedLakes(data);
       setLastGEEResults(data);
+      setDetectionMeta({
+        source_used: res.data.source_used,
+        source_label: res.data.source_label,
+        cascade: res.data.cascade || [],
+        fallback: !!res.data.fallback,
+        message: res.data.message,
+        total_detected: res.data.total_detected ?? data.length,
+      });
     } catch {
       alert('Detection failed');
     } finally {
@@ -2671,6 +2681,9 @@ function AppContent() {
                   <div>
                     <div style={eyebrow}>Remote Sensing</div>
                     <h3 style={sectionTitle}>Satellite Lake Detection</h3>
+                    <p style={{ margin: '8px 0 0', fontSize: 13, color: pal.mid, maxWidth: 520, lineHeight: 1.5 }}>
+                      Cascade: GEE Sentinel-2 → Planetary Computer S2 → Sentinel-1 SAR → Known Lakes Inventory
+                    </p>
                   </div>
                   <button
                     onClick={handleDetectLakes}
@@ -2688,13 +2701,74 @@ function AppContent() {
                   </button>
                 </div>
 
+                {/* Cascade step legend / last run status */}
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+                  gap: 10,
+                  marginBottom: 20,
+                }}>
+                  {[
+                    { step: 1, label: 'GEE Sentinel-2', key: 'gee_sentinel2' },
+                    { step: 2, label: 'Planetary Computer', key: 'mpc_sentinel2' },
+                    { step: 3, label: 'Sentinel-1 SAR', key: 'sentinel1_sar' },
+                    { step: 4, label: 'DB Inventory', key: 'database_inventory' },
+                  ].map((s) => {
+                    const attempt = (detectionMeta?.cascade || []).find((a) => a.step === s.step);
+                    const used = detectionMeta?.source_used === s.key;
+                    const st = attempt?.status;
+                    let bg = pal.panelAlt;
+                    let border = pal.border;
+                    let accent = pal.mid;
+                    if (used) {
+                      bg = 'rgba(45, 212, 142, 0.12)';
+                      border = '#2dd48e';
+                      accent = '#2dd48e';
+                    } else if (st === 'cloudy') {
+                      bg = 'rgba(251, 191, 36, 0.1)';
+                      border = '#fbbf24';
+                      accent = '#fbbf24';
+                    } else if (st === 'failed') {
+                      bg = 'rgba(248, 113, 113, 0.08)';
+                      border = '#f87171';
+                      accent = '#f87171';
+                    } else if (st === 'success') {
+                      accent = '#38bdf8';
+                      border = '#38bdf8';
+                    }
+                    return (
+                      <div
+                        key={s.step}
+                        style={{
+                          padding: '12px 14px',
+                          borderRadius: 12,
+                          border: `1px solid ${border}`,
+                          background: bg,
+                        }}
+                      >
+                        <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.6, color: accent, fontFamily: 'var(--font-mono)' }}>
+                          STEP {s.step}{used ? ' · USED' : st ? ` · ${String(st).toUpperCase()}` : ''}
+                        </div>
+                        <div style={{ marginTop: 4, fontSize: 13, fontWeight: 700, color: pal.hi }}>
+                          {s.label}
+                        </div>
+                        {attempt?.detail && (
+                          <div style={{ marginTop: 6, fontSize: 11, color: pal.mid, lineHeight: 1.35 }}>
+                            {attempt.detail}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
                 {detectedLakes.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: 60, color: pal.mid }}>
                     No detection results yet. Click “Run Satellite Detection”.
                   </div>
                 ) : (
                   <>
-                    <div style={{ display: 'flex', gap: 12, marginBottom: 20, flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', gap: 12, marginBottom: 20, flexWrap: 'wrap', alignItems: 'center' }}>
                       <button
                         onClick={handleSaveDetectedLakes}
                         disabled={saving}
@@ -2708,7 +2782,8 @@ function AppContent() {
                         {saving ? 'Saving...' : `Save ${detectedLakes.length} Lakes`}
                       </button>
                       <span style={{ fontSize: 13, color: pal.mid, alignSelf: 'center' }}>
-                        {detectedLakes.length} lakes detected · Sorted by area (largest first)
+                        {detectedLakes.length} lakes · {detectionMeta?.source_label || 'unknown source'}
+                        {detectionMeta?.fallback ? ' (offline fallback)' : ''}
                       </span>
                     </div>
 
@@ -2729,7 +2804,7 @@ function AppContent() {
                         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                           <thead>
                             <tr style={{ background: pal.panelAlt }}>
-                              {['#', 'Name', 'Area (ha)', 'Risk', 'Latitude', 'Longitude'].map(h => (
+                              {['#', 'Name', 'Area (ha)', 'Risk', 'Latitude', 'Longitude', 'Source'].map(h => (
                                 <th key={h} className="mono-label" style={{ padding: '12px 14px', fontSize: 10.5, color: pal.mid, textAlign: 'left' }}>
                                   {h}
                                 </th>
@@ -2749,7 +2824,7 @@ function AppContent() {
                                     {lake.name}
                                   </td>
                                   <td style={{ padding: '12px 14px', fontFamily: 'var(--font-mono)', color: pal.signal, fontWeight: 700 }}>
-                                    {lake.area_ha}
+                                    {lake.area_ha ?? '—'}
                                   </td>
                                   <td style={{ padding: '12px 14px' }}>
                                     <span style={{
@@ -2766,6 +2841,9 @@ function AppContent() {
                                   </td>
                                   <td style={{ padding: '12px 14px', fontFamily: 'var(--font-mono)', fontSize: 12.5, color: pal.mid }}>
                                     {lake.longitude?.toFixed(5) ?? '—'}
+                                  </td>
+                                  <td style={{ padding: '12px 14px', fontSize: 12, color: pal.mid, maxWidth: 200 }}>
+                                    {lake.source || detectionMeta?.source_label || '—'}
                                   </td>
                                 </tr>
                               );
