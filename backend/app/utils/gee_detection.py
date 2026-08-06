@@ -824,6 +824,40 @@ def get_historical_areas(lat: float, lon: float, years=None) -> dict:
 
 
 # ==================== LIVE SATELLITE THUMBNAILS ====================
+import threading
+import time as _time
+
+_THUMB_URL_CACHE: dict[str, tuple[float, dict]] = {}
+_THUMB_URL_LOCK = threading.Lock()
+_THUMB_URL_TTL_SEC = float(os.getenv("THUMB_URL_CACHE_TTL_SEC", str(20 * 60)))  # 20 min
+
+
+def _thumb_cache_key(lat: float, lon: float, buffer_m: float, mode: str) -> str:
+    return f"{round(float(lat), 4)}:{round(float(lon), 4)}:{int(buffer_m)}:{(mode or 'ndwi').lower()}"
+
+
+def _thumb_cache_get(key: str) -> dict | None:
+    with _THUMB_URL_LOCK:
+        item = _THUMB_URL_CACHE.get(key)
+        if not item:
+            return None
+        ts, payload = item
+        if _time.time() - ts > _THUMB_URL_TTL_SEC:
+            _THUMB_URL_CACHE.pop(key, None)
+            return None
+        return dict(payload)
+
+
+def _thumb_cache_set(key: str, payload: dict) -> None:
+    with _THUMB_URL_LOCK:
+        # Bound memory on free hosts
+        if len(_THUMB_URL_CACHE) > 200:
+            oldest = sorted(_THUMB_URL_CACHE.items(), key=lambda kv: kv[1][0])[:50]
+            for k, _ in oldest:
+                _THUMB_URL_CACHE.pop(k, None)
+        _THUMB_URL_CACHE[key] = (_time.time(), dict(payload))
+
+
 @_require_ee
 def get_lake_thumbnail(lat: float, lon: float, buffer_m: float = 2000, mode: str = "ndwi") -> dict:
     """
@@ -832,11 +866,20 @@ def get_lake_thumbnail(lat: float, lon: float, buffer_m: float = 2000, mode: str
       - 'rgb'  → true-color (Sentinel-2)
       - 'ndwi' → water-highlighted (Sentinel-2)
       - 'sar'  → Sentinel-1 VV backscatter (cloud-penetrating)
+
+    Results are cached briefly to avoid GEE + rate-limit storms when the UI
+    requests NDWI/RGB/SAR for the same basin/lake repeatedly.
     """
+    mode_l = (mode or "ndwi").lower()
+    key = _thumb_cache_key(lat, lon, buffer_m, mode_l)
+    cached = _thumb_cache_get(key)
+    if cached and cached.get("url"):
+        cached["cached"] = True
+        return cached
+
     try:
         point = ee.Geometry.Point([lon, lat])
         region = point.buffer(buffer_m)
-        mode_l = (mode or "ndwi").lower()
 
         if mode_l == "sar":
             from datetime import datetime, timedelta, timezone
@@ -861,13 +904,16 @@ def get_lake_thumbnail(lat: float, lon: float, buffer_m: float = 2000, mode: str
                 "format": "png",
             }
             url = s1.getThumbURL(vis)
-            return {
+            payload = {
                 "latitude": lat,
                 "longitude": lon,
                 "mode": "sar",
                 "url": url,
                 "source": "GEE Sentinel-1 SAR VV",
+                "cached": False,
             }
+            _thumb_cache_set(key, payload)
+            return payload
 
         date_start, date_end = _s2_date_window(summer_only=True)
         s2 = (
@@ -904,14 +950,16 @@ def get_lake_thumbnail(lat: float, lon: float, buffer_m: float = 2000, mode: str
             source = "GEE Sentinel-2 NDWI"
 
         url = image.getThumbURL(vis)
-
-        return {
+        payload = {
             "latitude": lat,
             "longitude": lon,
             "mode": mode_l,
             "url": url,
             "source": source,
+            "cached": False,
         }
+        _thumb_cache_set(key, payload)
+        return payload
     except Exception as e:
         return {
             "latitude": lat,
@@ -920,3 +968,31 @@ def get_lake_thumbnail(lat: float, lon: float, buffer_m: float = 2000, mode: str
             "url": None,
             "error": str(e),
         }
+
+
+@_require_ee
+def get_lake_thumbnails_pack(
+    lat: float,
+    lon: float,
+    buffer_m: float = 2000,
+    modes: list | None = None,
+) -> dict:
+    """
+    Batch NDWI / RGB / SAR thumbnail URLs in one API call (fewer rate-limit hits).
+    """
+    if modes is None:
+        modes = ["ndwi", "rgb", "sar"]
+    out = {"latitude": lat, "longitude": lon, "buffer_m": buffer_m, "modes": {}}
+    for m in modes:
+        m = (m or "").strip().lower()
+        if m not in ("ndwi", "rgb", "sar"):
+            continue
+        try:
+            out["modes"][m] = get_lake_thumbnail(lat, lon, buffer_m=buffer_m, mode=m)
+        except Exception as e:
+            out["modes"][m] = {
+                "mode": m,
+                "url": None,
+                "error": str(e),
+            }
+    return out

@@ -1,6 +1,12 @@
 # app/api/routers/gee.py
 
+import threading
+import time
+import urllib.request
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -11,6 +17,7 @@ from app.utils.gee_detection import (
     estimate_lake_exposure,
     get_historical_areas,
     get_lake_thumbnail,
+    get_lake_thumbnails_pack,
     gee_status,
 )
 from app.services.satellite_cascade import detect_lakes_cascade, cascade_status
@@ -22,11 +29,67 @@ router = APIRouter(
     tags=["Google Earth Engine"]
 )
 
+# PNG proxy cache — basin UI requests 3 modes × many switches; cache stops 429 storms
+_PNG_CACHE: dict[str, tuple[float, bytes, str]] = {}
+_PNG_LOCK = threading.Lock()
+_PNG_TTL_SEC = 20 * 60  # 20 minutes
+_PNG_MAX_ENTRIES = 120
+
 
 def _gee_http_error(e: Exception) -> HTTPException:
     msg = str(e)
     code = 503 if "unavailable" in msg.lower() or "not authenticated" in msg.lower() else 500
     return HTTPException(status_code=code, detail=msg)
+
+
+def _png_cache_key(lat: float, lon: float, mode: str, buffer_m: float) -> str:
+    return f"{round(float(lat), 4)}:{round(float(lon), 4)}:{(mode or 'ndwi').lower()}:{int(buffer_m)}"
+
+
+def _png_cache_get(key: str) -> Optional[tuple[bytes, str]]:
+    with _PNG_LOCK:
+        item = _PNG_CACHE.get(key)
+        if not item:
+            return None
+        ts, data, ctype = item
+        if time.time() - ts > _PNG_TTL_SEC:
+            _PNG_CACHE.pop(key, None)
+            return None
+        return data, ctype
+
+
+def _png_cache_set(key: str, data: bytes, content_type: str) -> None:
+    with _PNG_LOCK:
+        if len(_PNG_CACHE) >= _PNG_MAX_ENTRIES:
+            oldest = sorted(_PNG_CACHE.items(), key=lambda kv: kv[1][0])[:30]
+            for k, _ in oldest:
+                _PNG_CACHE.pop(k, None)
+        _PNG_CACHE[key] = (time.time(), data, content_type)
+
+
+def _fetch_thumb_png(lat: float, lon: float, mode: str, buffer_m: float) -> tuple[bytes, str, str]:
+    """Return (bytes, content_type, source_label). Uses URL + PNG caches."""
+    key = _png_cache_key(lat, lon, mode, buffer_m)
+    hit = _png_cache_get(key)
+    if hit:
+        return hit[0], hit[1], "cache"
+
+    result = get_lake_thumbnail(lat, lon, buffer_m=buffer_m, mode=mode)
+    if result.get("error") or not result.get("url"):
+        raise HTTPException(
+            status_code=503,
+            detail=result.get("error") or "No thumbnail URL from Earth Engine",
+        )
+    req = urllib.request.Request(
+        result["url"],
+        headers={"User-Agent": "GLOF-Portal/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        data = resp.read()
+        content_type = resp.headers.get("Content-Type", "image/png")
+    _png_cache_set(key, data, content_type)
+    sensor = "Sentinel-1-SAR" if (mode or "").lower() == "sar" else "Sentinel-2"
+    return data, content_type, sensor
 
 
 @router.get("/status")
@@ -119,7 +182,7 @@ def historical_area(
 
 
 @router.get("/thumbnail")
-@limiter.limit("15/minute")
+@limiter.limit("90/minute")
 def lake_thumbnail(
     request: Request,
     lat: float = Query(...),
@@ -145,8 +208,30 @@ def lake_thumbnail(
         raise _gee_http_error(e)
 
 
+@router.get("/thumbnails")
+@limiter.limit("40/minute")
+def lake_thumbnails_pack(
+    request: Request,
+    lat: float = Query(...),
+    lon: float = Query(...),
+    buffer_m: float = Query(2000, ge=500, le=50000),
+    modes: str = Query("ndwi,rgb,sar"),
+):
+    """
+    Batch thumbnail URLs in one request (basin / Find Lake UI).
+    modes=ndwi,rgb,sar
+    """
+    try:
+        mode_list = [m.strip() for m in (modes or "").split(",") if m.strip()]
+        if not mode_list:
+            mode_list = ["ndwi", "rgb", "sar"]
+        return get_lake_thumbnails_pack(lat, lon, buffer_m=buffer_m, modes=mode_list)
+    except Exception as e:
+        raise _gee_http_error(e)
+
+
 @router.get("/thumbnail-image")
-@limiter.limit("20/minute")
+@limiter.limit("120/minute")
 def lake_thumbnail_image(
     request: Request,
     lat: float = Query(...),
@@ -156,32 +241,16 @@ def lake_thumbnail_image(
 ):
     """
     Proxy GEE thumbnail as a real PNG so browsers can display it in <img src>.
-    Earth Engine v1 thumb URLs sometimes fail as direct image sources in the browser.
+    Cached ~20 min to avoid rate-limit storms when switching basins.
     """
-    import urllib.request
-    from fastapi.responses import Response
-
     try:
-        result = get_lake_thumbnail(lat, lon, buffer_m=buffer_m, mode=mode)
-        if result.get("error") or not result.get("url"):
-            raise HTTPException(
-                status_code=503,
-                detail=result.get("error") or "No thumbnail URL from Earth Engine",
-            )
-        req = urllib.request.Request(
-            result["url"],
-            headers={"User-Agent": "GLOF-Portal/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            data = resp.read()
-            content_type = resp.headers.get("Content-Type", "image/png")
-        sensor = "Sentinel-1-SAR" if (mode or "").lower() == "sar" else "Sentinel-2"
+        data, content_type, source = _fetch_thumb_png(lat, lon, mode, buffer_m)
         return Response(
             content=data,
             media_type=content_type,
             headers={
                 "Cache-Control": "public, max-age=600",
-                "X-GEE-Source": sensor,
+                "X-GEE-Source": source,
             },
         )
     except HTTPException:
