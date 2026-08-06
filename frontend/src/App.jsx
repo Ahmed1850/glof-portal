@@ -171,14 +171,15 @@ function AppContent() {
   const [thumbSar, setThumbSar] = useState(null);
   const [thumbLoading, setThumbLoading] = useState(false);
 
-  // Lake Details modal (inventory → Details)
+  // Lake Details modal (inventory → Details / Risk Assessment)
   const [detailHistData, setDetailHistData] = useState(null);
   const [detailHistLoading, setDetailHistLoading] = useState(false);
   const [detailThumbNdwi, setDetailThumbNdwi] = useState(null);
   const [detailThumbRgb, setDetailThumbRgb] = useState(null);
+  const [detailThumbSar, setDetailThumbSar] = useState(null);
   const [detailThumbLoading, setDetailThumbLoading] = useState(false);
 
-  // Register
+  // Register / Find Lake
   const [formData, setFormData] = useState({ name: '', area_ha: '', latitude: '', longitude: '' });
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState('');
@@ -187,6 +188,7 @@ function AppContent() {
   const [foundLakeForMap, setFoundLakeForMap] = useState(null);
   const [regThumbNdwi, setRegThumbNdwi] = useState(null);
   const [regThumbRgb, setRegThumbRgb] = useState(null);
+  const [regThumbSar, setRegThumbSar] = useState(null);
   const [regThumbLoading, setRegThumbLoading] = useState(false);
 
   const [renameLake, setRenameLake] = useState(null);
@@ -406,17 +408,19 @@ function AppContent() {
     setDetailHistData(null);
     setDetailThumbNdwi(null);
     setDetailThumbRgb(null);
+    setDetailThumbSar(null);
 
     if (!lake?.latitude || !lake?.longitude) return;
 
-    // Satellite images first (usually faster than full history series)
+    // Satellite images: NDWI + RGB + SAR (same as Historical / Find Lake)
     fetchThumbnails(lake, {
       setNdwi: setDetailThumbNdwi,
       setRgb: setDetailThumbRgb,
+      setSar: setDetailThumbSar,
       setLoading: setDetailThumbLoading,
     });
 
-    // Area history for this lake (same GEE series as Historical tab)
+    // Area history for this lake (hybrid S2 + SAR series)
     setDetailHistLoading(true);
     axios
       .get(`${API_BASE}/gee/historical`, {
@@ -432,6 +436,7 @@ function AppContent() {
     setDetailHistData(null);
     setDetailThumbNdwi(null);
     setDetailThumbRgb(null);
+    setDetailThumbSar(null);
     setDetailHistLoading(false);
     setDetailThumbLoading(false);
   };
@@ -550,6 +555,7 @@ function AppContent() {
     setFoundLakeForMap(null);
     setRegThumbNdwi(null);
     setRegThumbRgb(null);
+    setRegThumbSar(null);
     if (value.trim().length < 2) {
       setSuggestions([]);
       setShowSuggestions(false);
@@ -572,6 +578,19 @@ function AppContent() {
     });
     setFoundLakeForMap(lake);
     setShowSuggestions(false);
+    // Prefetch optical + SAR when picking from suggestions
+    if (lake.latitude != null && lake.longitude != null) {
+      setRegThumbLoading(true);
+      setRegThumbNdwi(null);
+      setRegThumbRgb(null);
+      setRegThumbSar(null);
+      fetchThumbnails(lake, {
+        setNdwi: setRegThumbNdwi,
+        setRgb: setRegThumbRgb,
+        setSar: setRegThumbSar,
+        setLoading: setRegThumbLoading,
+      });
+    }
   };
 
   const handleFindLake = async () => {
@@ -591,6 +610,7 @@ function AppContent() {
       setFoundLakeForMap(null);
       setRegThumbNdwi(null);
       setRegThumbRgb(null);
+      setRegThumbSar(null);
       return;
     }
 
@@ -607,20 +627,16 @@ function AppContent() {
       setRegThumbLoading(true);
       setRegThumbNdwi(null);
       setRegThumbRgb(null);
+      setRegThumbSar(null);
       try {
-        const [ndwiRes, rgbRes] = await Promise.all([
-          axios.get(`${API_BASE}/gee/thumbnail`, {
-            params: { lat: found.latitude, lon: found.longitude, mode: 'ndwi' }
-          }),
-          axios.get(`${API_BASE}/gee/thumbnail`, {
-            params: { lat: found.latitude, lon: found.longitude, mode: 'rgb' }
-          })
-        ]);
-        setRegThumbNdwi(ndwiRes.data.url);
-        setRegThumbRgb(rgbRes.data.url);
+        await fetchThumbnails(found, {
+          setNdwi: setRegThumbNdwi,
+          setRgb: setRegThumbRgb,
+          setSar: setRegThumbSar,
+          setLoading: setRegThumbLoading,
+        });
       } catch (err) {
         console.warn('Thumbnail load failed', err);
-      } finally {
         setRegThumbLoading(false);
       }
     }
@@ -743,6 +759,7 @@ function AppContent() {
       setFoundLakeForMap(null);
       setRegThumbNdwi(null);
       setRegThumbRgb(null);
+      setRegThumbSar(null);
       fetchLakes();
     } catch {
       setMessage('Failed to register');
@@ -2035,8 +2052,9 @@ function AppContent() {
               <div style={{ ...cardStyle, padding: 32 }}>
                 <div style={eyebrow}>Field Registration</div>
                 <h3 style={{ ...sectionTitle, marginBottom: 6 }}>Register New Lake</h3>
-                <p style={{ margin: '0 0 24px', color: pal.mid, fontSize: 13.5 }}>
-                  Type a lake name → click <strong>Find Lake</strong> → coordinates & satellite images will fill automatically.
+                <p style={{ margin: '0 0 24px', color: pal.mid, fontSize: 13.5, lineHeight: 1.5 }}>
+                  Type a lake name → click <strong>Find Lake</strong> → coordinates and live satellite imagery fill automatically
+                  (Sentinel-2 NDWI / RGB + <strong>Sentinel-1 SAR</strong> all-weather view).
                 </p>
 
                 <form onSubmit={handleSubmit} style={{ display: 'grid', gap: 16 }}>
@@ -2157,27 +2175,40 @@ function AppContent() {
               </div>
 
               {(formData.latitude && formData.longitude) && (
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 20 }}>
                   <div style={{ ...cardStyle, padding: 20 }}>
-                    <div style={eyebrow}>Live Satellite</div>
+                    <div style={eyebrow}>Optical · S2</div>
                     <h3 style={{ ...sectionTitle, marginBottom: 12 }}>NDWI / Water Highlight</h3>
                     {regThumbLoading ? (
-                      <div style={{ height: 280, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>Loading NDWI image...</div>
+                      <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>Loading NDWI image...</div>
                     ) : regThumbNdwi ? (
                       <img src={regThumbNdwi} alt="NDWI" style={{ width: '100%', borderRadius: 12, border: `1px solid ${pal.border}` }} />
                     ) : (
-                      <div style={{ height: 280, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo }}>Click Find Lake to load image</div>
+                      <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo }}>Click Find Lake to load image</div>
                     )}
                   </div>
                   <div style={{ ...cardStyle, padding: 20 }}>
-                    <div style={eyebrow}>Live Satellite</div>
+                    <div style={eyebrow}>Optical · S2</div>
                     <h3 style={{ ...sectionTitle, marginBottom: 12 }}>True Color (RGB)</h3>
                     {regThumbLoading ? (
-                      <div style={{ height: 280, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>Loading RGB image...</div>
+                      <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>Loading RGB image...</div>
                     ) : regThumbRgb ? (
                       <img src={regThumbRgb} alt="RGB" style={{ width: '100%', borderRadius: 12, border: `1px solid ${pal.border}` }} />
                     ) : (
-                      <div style={{ height: 280, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo }}>Click Find Lake to load image</div>
+                      <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo }}>Click Find Lake to load image</div>
+                    )}
+                  </div>
+                  <div style={{ ...cardStyle, padding: 20 }}>
+                    <div style={eyebrow}>Radar · S1</div>
+                    <h3 style={{ ...sectionTitle, marginBottom: 12 }}>SAR VV (all-weather)</h3>
+                    {regThumbLoading ? (
+                      <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.mid }}>Loading SAR image...</div>
+                    ) : regThumbSar ? (
+                      <img src={regThumbSar} alt="SAR VV" style={{ width: '100%', borderRadius: 12, border: `1px solid ${pal.border}` }} />
+                    ) : (
+                      <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: pal.lo, textAlign: 'center', padding: 12 }}>
+                        SAR not available — click Find Lake (needs GEE)
+                      </div>
                     )}
                   </div>
                 </div>
@@ -3353,13 +3384,13 @@ function AppContent() {
                   <p style={{ margin: 0, fontSize: 14, color: pal.mid }}>{exp.reason}</p>
                 </div>
 
-                {/* Satellite imagery — same sources as Historical tab */}
+                {/* Satellite imagery — optical + SAR risk assessment */}
                 <div>
-                  <div style={eyebrow}>Live Satellite</div>
+                  <div style={eyebrow}>Live Satellite · Risk Assessment</div>
                   <h3 style={{ ...sectionTitle, marginBottom: 12, fontSize: 16 }}>
-                    Sentinel Imagery · NDWI & True Color
+                    Sentinel Imagery · NDWI, RGB & SAR
                   </h3>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 16 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 }}>
                     <div style={{ background: pal.panelAlt, borderRadius: 14, padding: 14, border: `1px solid ${pal.border}` }}>
                       <div style={{ fontSize: 13, fontWeight: 700, color: pal.hi, marginBottom: 10 }}>
                         NDWI / Water Highlight
@@ -3396,9 +3427,27 @@ function AppContent() {
                         </div>
                       )}
                     </div>
+                    <div style={{ background: pal.panelAlt, borderRadius: 14, padding: 14, border: `1px solid ${pal.border}` }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: pal.hi, marginBottom: 10 }}>
+                        SAR VV (all-weather)
+                      </div>
+                      {detailThumbLoading ? (
+                        <div style={imgBox}>Loading SAR image…</div>
+                      ) : detailThumbSar ? (
+                        <img
+                          src={detailThumbSar}
+                          alt={`${selectedLake.name} SAR`}
+                          style={{ width: '100%', borderRadius: 12, border: `1px solid ${pal.border}`, display: 'block' }}
+                        />
+                      ) : (
+                        <div style={imgBox}>
+                          {selectedLake.latitude ? 'SAR not available (needs GEE)' : 'No coordinates for this lake'}
+                        </div>
+                      )}
+                    </div>
                   </div>
                   <p style={{ margin: '10px 0 0', fontSize: 12, color: pal.lo }}>
-                    Data source: Google Earth Engine · Sentinel-2 NDWI + Sentinel-1 SAR hybrid (same as Historical Analysis)
+                    Data source: Google Earth Engine · Sentinel-2 NDWI/RGB + Sentinel-1 SAR VV (cloud-penetrating)
                   </p>
                 </div>
 
