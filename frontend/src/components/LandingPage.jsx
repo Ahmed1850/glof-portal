@@ -58,7 +58,7 @@ function StatTile({ value, label, sub, accent }) {
   );
 }
 
-function FeatureCard({ icon: Icon, title, desc }) {
+function FeatureCard({ icon: Icon, title, desc, badge }) {
   return (
     <motion.div
       variants={cardItem}
@@ -74,8 +74,29 @@ function FeatureCard({ icon: Icon, title, desc }) {
         background: 'rgba(12,24,38,0.55)',
         border: '1px solid rgba(103,232,249,0.12)',
         cursor: 'default',
+        position: 'relative',
       }}
     >
+      {badge && (
+        <span
+          className="mono-label"
+          style={{
+            position: 'absolute',
+            top: 12,
+            right: 12,
+            fontSize: 9,
+            fontWeight: 700,
+            letterSpacing: 0.6,
+            color: '#5eead4',
+            background: 'rgba(94,234,212,0.1)',
+            border: '1px solid rgba(94,234,212,0.22)',
+            padding: '3px 7px',
+            borderRadius: 999,
+          }}
+        >
+          {badge}
+        </span>
+      )}
       <motion.div
         whileHover={{ rotate: [0, -6, 6, 0], scale: 1.06 }}
         transition={{ duration: 0.45 }}
@@ -87,7 +108,7 @@ function FeatureCard({ icon: Icon, title, desc }) {
       >
         <Icon size={17} color="#5eead4" />
       </motion.div>
-      <div style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: 14, color: '#eaf4f8', marginBottom: 6 }}>
+      <div style={{ fontFamily: 'var(--font-display)', fontWeight: 700, fontSize: 14, color: '#eaf4f8', marginBottom: 6, paddingRight: badge ? 48 : 0 }}>
         {title}
       </div>
       <div style={{ fontSize: 12.5, color: '#8ea3ba', lineHeight: 1.5 }}>
@@ -96,6 +117,42 @@ function FeatureCard({ icon: Icon, title, desc }) {
     </motion.div>
   );
 }
+
+const FEATURES = [
+  {
+    icon: IconSatellite,
+    title: 'Multi-Source Detection',
+    badge: 'CASCADE',
+    desc: 'GEE Sentinel-2 → Planetary Computer → Sentinel-1 SAR → known-lakes inventory when clouds or sensors fail',
+  },
+  {
+    icon: IconPulseDot,
+    title: 'Flood Monitoring',
+    badge: 'S2 + SAR',
+    desc: 'Early-warning scores from area, growth (optical then SAR), elevation, glaciers & downstream population',
+  },
+  {
+    icon: IconGlobe,
+    title: 'GLOF Basins',
+    desc: 'Drainage corridors, storage nodes, outburst volume and basin-center NDWI / RGB / SAR views',
+  },
+  {
+    icon: IconShield,
+    title: 'Hybrid Historical',
+    badge: '2015–2025',
+    desc: 'Dual-sensor area series: Sentinel-2 NDWI with Sentinel-1 SAR fill for cloudy monsoon summers',
+  },
+  {
+    icon: IconInfo,
+    title: 'Population Exposure',
+    desc: 'WorldPop danger & warning zones with interactive lake limits (5 / 10 / 15) prioritising High risk',
+  },
+  {
+    icon: IconMountain,
+    title: 'Find Lake & Assessment',
+    desc: 'Name search auto-fills coords plus live NDWI, true-color and all-weather SAR for risk profiles',
+  },
+];
 
 export default function LandingPage({ onLaunch }) {
   return (
@@ -162,7 +219,9 @@ export default function LandingPage({ onLaunch }) {
         <span style={{ opacity: 0.4 }}>·</span>
         <span>GLOF RISK INTELLIGENCE</span>
         <span style={{ opacity: 0.4 }}>·</span>
-        <span>SENTINEL-2 · WORLDPOP · NDWI</span>
+        <span>S2 · S1-SAR · MPC · WORLDPOP</span>
+        <span style={{ opacity: 0.4 }}>·</span>
+        <span>GEE CASCADE</span>
         <span style={{ opacity: 0.4 }}>·</span>
         <span>GILGIT-BALTISTAN</span>
       </motion.div>
@@ -233,7 +292,7 @@ export default function LandingPage({ onLaunch }) {
             }}
           >
             <IconGlobe size={13} color="#5eead4" />
-            Gilgit-Baltistan Operational Coverage
+            Gilgit-Baltistan · Multi-Sensor Operational Coverage
           </motion.div>
 
           <motion.h1
@@ -241,7 +300,7 @@ export default function LandingPage({ onLaunch }) {
             style={{
               fontFamily: 'var(--font-display)', fontSize: 'clamp(36px, 5.4vw, 60px)',
               fontWeight: 700, lineHeight: 1.08, margin: '0 0 22px', letterSpacing: '-0.025em',
-              maxWidth: 820,
+              maxWidth: 860,
             }}
           >
             Every glacial lake,<br />
@@ -257,12 +316,12 @@ export default function LandingPage({ onLaunch }) {
           <motion.p
             variants={fadeUp}
             style={{
-              fontSize: 16.5, color: '#8ea3ba', maxWidth: 560, lineHeight: 1.7, marginBottom: 36,
+              fontSize: 16.5, color: '#8ea3ba', maxWidth: 620, lineHeight: 1.7, marginBottom: 36,
             }}
           >
-            Operational GLOF intelligence for Northern Pakistan — live satellite detection,
-            population exposure, multi-year lake change, danger zones, and field-ready reporting
-            in one command surface.
+            Operational GLOF intelligence for Northern Pakistan — multi-source satellite cascade
+            (optical + all-weather SAR), flood early warning, basin routing, hybrid lake history,
+            population exposure, and field registration in one command surface.
           </motion.p>
 
           <motion.div
@@ -286,10 +345,55 @@ export default function LandingPage({ onLaunch }) {
             >
               Launch Command Dashboard →
             </motion.button>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 9, color: '#5b7690', fontSize: 13 }}>
-              <IconSatellite size={16} color="#5b7690" />
-              GEE · Sentinel-2 · WorldPop connected
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, color: '#5b7690', fontSize: 13 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+                <IconSatellite size={16} color="#5b7690" />
+                GEE · Sentinel-2 · Sentinel-1 SAR · Planetary Computer
+              </div>
+              <div style={{ fontSize: 11.5, color: '#5b7690', paddingLeft: 25, opacity: 0.85 }}>
+                Cascade fallbacks · WorldPop · Flood board · Basins
+              </div>
             </div>
+          </motion.div>
+
+          {/* Pipeline strip */}
+          <motion.div
+            variants={fadeUp}
+            className="mono-label"
+            style={{
+              display: 'flex',
+              flexWrap: 'wrap',
+              alignItems: 'center',
+              gap: 8,
+              marginBottom: 28,
+              maxWidth: 960,
+              fontSize: 10.5,
+              color: '#8ea3ba',
+            }}
+          >
+            <span style={{ color: '#5b7690', marginRight: 4 }}>DETECTION PIPELINE</span>
+            {[
+              { t: '1 · GEE S2', c: '#5eead4' },
+              { t: '2 · MPC S2', c: '#38bdf8' },
+              { t: '3 · S1 SAR', c: '#fbbf24' },
+              { t: '4 · Inventory', c: '#8ea3ba' },
+            ].map((step, i) => (
+              <span key={step.t} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                {i > 0 && <span style={{ opacity: 0.35 }}>→</span>}
+                <span
+                  style={{
+                    padding: '5px 10px',
+                    borderRadius: 8,
+                    border: `1px solid ${step.c}44`,
+                    background: `${step.c}12`,
+                    color: step.c,
+                    fontWeight: 700,
+                  }}
+                >
+                  {step.t}
+                </span>
+              </span>
+            ))}
           </motion.div>
 
           {/* Core capabilities */}
@@ -297,32 +401,21 @@ export default function LandingPage({ onLaunch }) {
             variants={staggerContainer}
             style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
               gap: 12,
               marginBottom: 36,
               maxWidth: 960,
             }}
           >
-            <FeatureCard
-              icon={IconSatellite}
-              title="Satellite Detection"
-              desc="Sentinel-2 NDWI lake detection via Google Earth Engine"
-            />
-            <FeatureCard
-              icon={IconInfo}
-              title="Population Exposure"
-              desc="WorldPop-based danger & warning zone estimates"
-            />
-            <FeatureCard
-              icon={IconShield}
-              title="Historical Analysis"
-              desc="2015–2025 area trends and live satellite thumbnails"
-            />
-            <FeatureCard
-              icon={IconGlobe}
-              title="Risk Intelligence"
-              desc="Auto risk scoring, naming, analytics & export tools"
-            />
+            {FEATURES.map((f) => (
+              <FeatureCard
+                key={f.title}
+                icon={f.icon}
+                title={f.title}
+                desc={f.desc}
+                badge={f.badge}
+              />
+            ))}
           </motion.div>
 
           {/* Telemetry panel */}
@@ -331,14 +424,16 @@ export default function LandingPage({ onLaunch }) {
             className="hud-frame"
             whileHover={{ borderColor: 'rgba(94,234,212,0.28)' }}
             style={{
-              display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 24,
+              display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 24,
               padding: '28px 32px', background: 'rgba(12,24,38,0.7)', backdropFilter: 'blur(14px)',
               border: '1px solid var(--line, rgba(103,232,249,0.14))', borderRadius: 16, maxWidth: 960,
             }}
           >
-            <StatTile value="GEE" label="Earth Engine" sub="Live NDWI + WorldPop" accent="#5eead4" />
-            <StatTile value="10yr" label="History Window" sub="2015–2025 composites" accent="#38bdf8" />
-            <StatTile value="Zones" label="Exposure Layers" sub="Danger + Warning buffers" accent="#5eead4" />
+            <StatTile value="4×" label="Sensor Cascade" sub="GEE · MPC · SAR · DB" accent="#5eead4" />
+            <StatTile value="S1" label="All-Weather SAR" sub="Cloud-penetrating VV" accent="#fbbf24" />
+            <StatTile value="11yr" label="Hybrid History" sub="S2 NDWI + SAR series" accent="#38bdf8" />
+            <StatTile value="EW" label="Flood Board" sub="Growth · pop · basins" accent="#5eead4" />
+            <StatTile value="5–15" label="Pop. Limits" sub="High-risk first scan" accent="#f0433a" />
             <StatTile value="GB" label="Coverage" sub="Gilgit-Baltistan focus" accent="#38bdf8" />
           </motion.div>
         </motion.div>
@@ -355,7 +450,7 @@ export default function LandingPage({ onLaunch }) {
           fontSize: 12.5, color: '#5b7690', position: 'relative', zIndex: 10, flexWrap: 'wrap', gap: 10,
         }}
       >
-        <div className="mono-label" style={{ fontWeight: 600 }}>GLOF PORTAL · PNDDT / IST</div>
+        <div className="mono-label" style={{ fontWeight: 600 }}>GLOF PORTAL</div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <motion.span
             animate={{ opacity: [1, 0.4, 1] }}
@@ -364,7 +459,7 @@ export default function LandingPage({ onLaunch }) {
           >
             <IconPulseDot color="#2dd48e" />
           </motion.span>
-          System Operational
+          System Operational · Optical + SAR Ready
         </div>
       </motion.footer>
     </motion.div>
