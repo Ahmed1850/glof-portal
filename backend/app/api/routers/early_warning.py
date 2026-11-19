@@ -297,6 +297,8 @@ def assess_lake(
     use_gee: bool = True,
     include_population: bool = True,
     shared_temp: Optional[dict] = None,
+    shared_elevation: Optional[float] = None,
+    elevation_prewarmed: bool = False,
 ) -> dict:
     """
     Score one lake.
@@ -333,14 +335,22 @@ def assess_lake(
 
     growth = None
     growth_source = None
-    if use_gee:
-        # Elevation: Open-Meteo only (never fall through to GEE SRTM — that adds
-        # another slow getInfo on the same critical path as growth/pop).
+    if shared_elevation is not None:
+        elevation_m = shared_elevation
+        elevation_source = "Open-Meteo"
+    elif not elevation_prewarmed:
         elevation_m = fetch_elevation_open_meteo(lat, lon)
         elevation_source = "Open-Meteo" if elevation_m is not None else None
-        if elevation_m is None:
-            elevation_m = fetch_elevation_open_elevation(lat, lon)
-            elevation_source = "Open-Elevation" if elevation_m is not None else None
+    else:
+        elevation_m = None
+        elevation_source = None
+
+    if elevation_m is None:
+        elevation_m = fetch_elevation_open_elevation(lat, lon)
+        elevation_source = "Open-Elevation" if elevation_m is not None else None
+
+    if use_gee:
+        # Never fall through to GEE SRTM — that adds another slow getInfo on the critical path.
         try:
             growth, growth_source = fetch_growth_from_gee(lat, lon)
             if growth is not None and not growth_source:
@@ -361,11 +371,6 @@ def assess_lake(
             pop["source"] = f"heuristic (GEE pop error: {e})"
     else:
         # FAST: never call GEE (avoids timeout / hang on Render free tier)
-        elevation_m = fetch_elevation_open_meteo(lat, lon)
-        elevation_source = "Open-Meteo" if elevation_m is not None else None
-        if elevation_m is None:
-            elevation_m = fetch_elevation_open_elevation(lat, lon)
-            elevation_source = "Open-Elevation" if elevation_m is not None else None
         pop = _population_heuristic(lat, lon, area_ha) if include_population else {
             "danger_population": 0,
             "warning_population": 0,
@@ -618,8 +623,14 @@ def monitor_all_lakes(
     lakes: List[LakeModel] = q.offset(offset).limit(limit).all()
     has_more = (offset + len(lakes)) < total_inventory
 
-    # One regional temperature for all lakes (avoids 50 Open-Meteo calls)
+    # One regional temperature & one batch elevation query for all lakes (avoids 46x HTTP calls)
     shared_temp = fetch_temperature(35.92, 74.31)
+    geo_lakes = [l for l in lakes if l.latitude is not None and l.longitude is not None]
+    batch_elevs: dict[int, Optional[float]] = {}
+    if geo_lakes:
+        elev_vals, _ = fetch_elevations_batch([(float(l.latitude), float(l.longitude)) for l in geo_lakes])
+        for l_obj, e_val in zip(geo_lakes, elev_vals):
+            batch_elevs[l_obj.id] = e_val
 
     results = []
     # GEE: sequential or tiny pool — parallel getInfo often worsens latency/rate-limits on free hosts.
@@ -641,6 +652,8 @@ def monitor_all_lakes(
             use_gee=use_gee and not force_fast,
             include_population=True,
             shared_temp=shared_temp,
+            shared_elevation=batch_elevs.get(lake.id),
+            elevation_prewarmed=bool(geo_lakes),
         )
 
     if not use_gee:

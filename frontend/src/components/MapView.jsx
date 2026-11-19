@@ -81,30 +81,41 @@ const get3DMarkerIcon = (riskLevel) => {
   });
 };
 
-// ==================== BASEMAPS ====================
+// ==================== BASEMAPS (Google Maps + GIS Tiles) ====================
 const MAP_LAYERS = {
-  light: {
-    name: 'Clean Light',
-    IconComponent: IconMap,
-    url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-    attribution: '&copy; OpenStreetMap &copy; CARTO',
+  hybrid: {
+    name: 'Google Hybrid',
+    IconComponent: IconSatellite,
+    url: 'https://{s}.google.com/vt/lyrs=s,h&x={x}&y={y}&z={z}',
+    subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+    attribution: '&copy; Google Maps Satellite &amp; Hybrid',
   },
   satellite: {
-    name: 'Satellite',
-    IconComponent: IconSatellite,
-    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    attribution: '&copy; Esri',
+    name: 'Google Satellite',
+    IconComponent: IconGlobe,
+    url: 'https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+    subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+    attribution: '&copy; Google Maps Satellite',
   },
-  topo: {
-    name: 'Topo Terrain',
+  terrain: {
+    name: 'Google Terrain',
     IconComponent: IconMountain,
-    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
-    attribution: '&copy; Esri &copy; USGS',
+    url: 'https://{s}.google.com/vt/lyrs=p&x={x}&y={y}&z={z}',
+    subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+    attribution: '&copy; Google Maps Terrain',
+  },
+  roadmap: {
+    name: 'Google Streets',
+    IconComponent: IconMap,
+    url: 'https://{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',
+    subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+    attribution: '&copy; Google Maps',
   },
   dark: {
-    name: 'Dark',
+    name: 'Dark GIS',
     IconComponent: IconMoon,
     url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    subdomains: ['a', 'b', 'c', 'd'],
     attribution: '&copy; OpenStreetMap &copy; CARTO',
   },
 };
@@ -152,7 +163,7 @@ const MapView = ({
   defaultShowDanger = true,
   defaultShowWarning = true,
 }) => {
-  const [activeLayer, setActiveLayer] = useState('dark');
+  const [activeLayer, setActiveLayer] = useState('hybrid');
   const [showLayersPanel, setShowLayersPanel] = useState(true);
 
   const [layers, setLayers] = useState({
@@ -655,6 +666,8 @@ const MapView = ({
             key={activeLayer}
             attribution={MAP_LAYERS[activeLayer].attribution}
             url={MAP_LAYERS[activeLayer].url}
+            subdomains={MAP_LAYERS[activeLayer].subdomains || ['a', 'b', 'c']}
+            maxZoom={20}
           />
 
           {layers.provincial && provincialData && (

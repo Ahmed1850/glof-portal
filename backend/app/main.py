@@ -163,7 +163,7 @@ def _warm_weather_cache():
 if os.getenv("WARM_WEATHER_ON_START", "1") in ("1", "true", "True", "yes"):
     _warm_weather_cache()
 
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+STATIC_DIR = Path(os.getenv("GLOF_STATIC_DIR") or (Path(__file__).resolve().parent.parent / "static"))
 
 
 @app.get("/health")

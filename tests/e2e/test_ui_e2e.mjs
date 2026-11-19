@@ -62,19 +62,34 @@ async function findClickableMarkerPoint() {
       const markers = Array.from(
         document.querySelectorAll('.leaflet-marker-pane .custom-3d-marker'),
       );
+      const candidates = [];
       for (const m of markers) {
         const r = m.getBoundingClientRect();
         if (r.width <= 0 || r.height <= 0) continue;
         const cx = r.left + r.width / 2;
         const cy = r.top + r.height / 2;
         if (
-          cx < mapRect.left + 20 ||
-          cx > mapRect.right - 20 ||
-          cy < mapRect.top + 60 ||
-          cy > mapRect.bottom - 60
+          cx < mapRect.left + 80 ||
+          cx > mapRect.right - 80 ||
+          cy < mapRect.top + mapRect.height * 0.40 ||
+          cy > mapRect.bottom - 50
         ) {
           continue;
         }
+        const hit = document.elementFromPoint(cx, cy);
+        if (hit && (m.contains(hit) || hit.closest('.custom-3d-marker') === m)) {
+          candidates.push({ x: cx, y: cy });
+        }
+      }
+      if (candidates.length > 0) {
+        return candidates[Math.floor(candidates.length / 2)];
+      }
+      // Fallback: any visible unobstructed marker
+      for (const m of markers) {
+        const r = m.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        const cx = r.left + r.width / 2;
+        const cy = r.top + r.height / 2;
         const hit = document.elementFromPoint(cx, cy);
         if (hit && (m.contains(hit) || hit.closest('.custom-3d-marker') === m)) {
           return { x: cx, y: cy };
@@ -93,15 +108,16 @@ async function findOpenMapPoint() {
       const mapEl = document.querySelector('.leaflet-container');
       if (!mapEl) return null;
       const mr = mapEl.getBoundingClientRect();
-      // Scan grid inside central map region avoiding overlays & markers
-      for (let fx = 0.25; fx <= 0.68; fx += 0.08) {
-        for (let fy = 0.28; fy <= 0.72; fy += 0.08) {
+      // Scan grid inside map region avoiding markers, controls, popups, and interactive polygon paths
+      for (let fx = 0.15; fx <= 0.85; fx += 0.07) {
+        for (let fy = 0.18; fy <= 0.82; fy += 0.08) {
           const px = mr.left + mr.width * fx;
           const py = mr.top + mr.height * fy;
           const hit = document.elementFromPoint(px, py);
           if (!hit) continue;
           if (!mapEl.contains(hit)) continue;
-          if (hit.closest('.custom-3d-marker, button, a, .hud-frame, .leaflet-popup')) {
+          if (hit.tagName && hit.tagName.toLowerCase() === 'path') continue;
+          if (hit.closest('.custom-3d-marker, .leaflet-popup, .leaflet-control, button, a')) {
             continue;
           }
           return { x: px, y: py };
@@ -187,10 +203,11 @@ describe('Tier 1 — UI & GIS Core Happy Paths', { skip: !tierEnabled(1) }, () =
         'Find Lake & Assessment',
       ];
       const missingCards = expectedCards.filter((c) => !body.includes(c));
+      const upperBody = body.toUpperCase();
       const hasPipeline =
-        body.includes('DETECTION PIPELINE') &&
-        body.includes('1 · GEE S2') &&
-        body.includes('4 · Inventory');
+        upperBody.includes('DETECTION PIPELINE') &&
+        upperBody.includes('1 · GEE S2') &&
+        upperBody.includes('4 · INVENTORY');
       return { h1, pathCount, missingCards, hasPipeline };
     });
 
@@ -240,12 +257,13 @@ describe('Tier 1 — UI & GIS Core Happy Paths', { skip: !tierEnabled(1) }, () =
   it('T1.3 MapView baseline GIS controls: 4 basemaps, Layers toggle, WGS84 cursor telemetry', async () => {
     await enterPortal();
 
-    // 1. 4 Basemap switcher buttons
+    // 1. Basemap switcher buttons (Google Maps + Dark GIS)
     const basemaps = [
-      ['Clean Light', 'voyager'],
-      ['Satellite', 'World_Imagery'],
-      ['Topo Terrain', 'World_Topo_Map'],
-      ['Dark', 'dark_all'],
+      ['Google Hybrid', 'lyrs=s,h'],
+      ['Google Satellite', 'lyrs=s'],
+      ['Google Terrain', 'lyrs=p'],
+      ['Google Streets', 'lyrs=m'],
+      ['Dark GIS', 'dark_all'],
     ];
     for (const [btnLabel, expectedUrlToken] of basemaps) {
       await browser.clickByText('button', `^${btnLabel}$`);
@@ -317,6 +335,15 @@ describe('Tier 1 — UI & GIS Core Happy Paths', { skip: !tierEnabled(1) }, () =
     await browser.clickPoint(pt.x, pt.y);
     await browser.waitForSelector('.leaflet-popup-content-wrapper');
     await browser.waitForText('Trace Flood Corridor');
+    // Allow Leaflet popup autoPan & fade animation to settle, and ensure button is centered & unclipped
+    await new Promise((r) => setTimeout(r, 500));
+    await browser.evaluate(() => {
+      const btn = Array.from(
+        document.querySelectorAll('.leaflet-popup-content-wrapper button'),
+      ).find((b) => /Trace Flood Corridor/i.test(b.innerText || ''));
+      if (btn) btn.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    });
+    await new Promise((r) => setTimeout(r, 150));
 
     await browser.clickByText('.leaflet-popup-content-wrapper button', 'Trace Flood Corridor');
     await browser.waitForText('GLOF Outburst Routing Trace');

@@ -298,11 +298,15 @@ def compare_lakes(db: Session, lake_ids: Optional[str] = None) -> dict[str, Any]
         if len(raw_parts) > 6:
             raise HTTPException(status_code=400, detail="Maximum 6 lakes can be compared at once")
         parsed_ids: list[int] = []
+        seen_ids: set[int] = set()
         for p in raw_parts:
             try:
-                parsed_ids.append(int(p))
+                lid = int(p)
             except ValueError:
                 raise HTTPException(status_code=400, detail=f"Invalid lake_id '{p}'")
+            if lid not in seen_ids:
+                seen_ids.add(lid)
+                parsed_ids.append(lid)
 
         rows = db.query(LakeModel).filter(LakeModel.id.in_(parsed_ids)).all()
         by_id = {r.id: r for r in rows}

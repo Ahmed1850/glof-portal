@@ -142,10 +142,11 @@ def simulate_breach(
         cum_dists_km.append(cum_km)
 
     elevations_raw, elev_source = fetch_elevations_batch([(p[0], p[1]) for p in route_points])
-    fallback_used = any(v is None for v in elevations_raw)
+    has_missing = any(v is None for v in elevations_raw)
+    fallback_used = has_missing or ("stale" in elev_source.lower()) or ("offline" in elev_source.lower())
 
     resolved_elevs: list[float] = []
-    if fallback_used:
+    if has_missing:
         head_alt = _HEADWATER_ALT_BY_BASIN.get(basin["id"], 3950.0)
         for idx, raw_e in enumerate(elevations_raw):
             if raw_e is not None:

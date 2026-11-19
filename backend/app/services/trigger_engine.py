@@ -22,7 +22,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.lake import Lake as LakeModel
-from app.services.elevation_service import fetch_elevation_open_meteo
+from app.services.elevation_service import fetch_elevation_open_meteo, fetch_elevations_batch
 from app.services.geo_helpers import haversine_km
 from app.services.glof_basins import assign_basin
 from app.services.provider_telemetry import record_provider_event, register_cache_counter
@@ -38,8 +38,9 @@ _HTTP_TIMEOUT_SEC = min(5.0, float(os.getenv("TRIGGER_TIMEOUT_SEC", "4.5")))
 _MAX_CACHE_ENTRIES = 250
 
 _REGIONAL_CENTER = (35.85, 74.50)
-_USGS_REGIONAL_KEY = "regional:35.85:74.50:350"
+_USGS_REGIONAL_KEY = "regional:35.85:74.50:420"
 _HEADERS = {"User-Agent": "GLOF-Portal/1.0 (trigger-engine; educational)"}
+_ORIG_FETCH_ELEV = fetch_elevation_open_meteo
 
 _OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 _OPEN_METEO_GLOFAS_URL = "https://flood-api.open-meteo.com/v1/flood"
@@ -48,6 +49,118 @@ _USGS_COMCAT_URL = "https://earthquake.usgs.gov/fdsnws/event/1/query"
 register_cache_counter("Open-Meteo Weather", lambda: len(_FORECAST_CACHE))
 register_cache_counter("Open-Meteo GloFAS", lambda: len(_GLOFAS_CACHE))
 register_cache_counter("USGS ComCat", lambda: len(_USGS_CACHE))
+
+
+def _to_finite_float(val: Any) -> Optional[float]:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _validate_numeric_list(arr: Any, *, min_len: int = 0, min_finite: int = 0, name: str = "array") -> None:
+    if not isinstance(arr, list) or len(arr) < min_len:
+        raise ValueError(f"Invalid {name}: expected list of length >= {min_len}")
+    finite_count = 0
+    for item in arr:
+        if item is None:
+            continue
+        if _to_finite_float(item) is None:
+            raise ValueError(f"Invalid non-finite element in {name}")
+        finite_count += 1
+    if finite_count < min_finite:
+        raise ValueError(f"Insufficient finite elements in {name}")
+
+
+def _validate_forecast_payload(data: Any) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("Open-Meteo Forecast payload is not a JSON object")
+    if data.get("elevation") is not None and _to_finite_float(data.get("elevation")) is None:
+        raise ValueError("Open-Meteo Forecast returned non-finite elevation")
+    daily = data.get("daily")
+    if not isinstance(daily, dict):
+        raise ValueError("Open-Meteo Forecast missing daily object")
+    times = daily.get("time")
+    if not isinstance(times, list) or len(times) < 14 or not all(isinstance(t, str) and t.strip() for t in times[:14]):
+        raise ValueError("Open-Meteo Forecast daily.time must have >= 14 date strings")
+    _validate_numeric_list(daily.get("temperature_2m_max"), min_len=14, min_finite=7, name="daily.temperature_2m_max")
+    _validate_numeric_list(daily.get("temperature_2m_min"), min_len=14, min_finite=7, name="daily.temperature_2m_min")
+    _validate_numeric_list(daily.get("precipitation_sum"), min_len=14, min_finite=1, name="daily.precipitation_sum")
+
+    hourly = data.get("hourly")
+    if hourly is not None:
+        if not isinstance(hourly, dict):
+            raise ValueError("Open-Meteo Forecast hourly must be an object")
+        if hourly.get("time") is not None and not isinstance(hourly.get("time"), list):
+            raise ValueError("Open-Meteo Forecast hourly.time must be a list")
+        if hourly.get("freezing_level_height") is not None:
+            _validate_numeric_list(hourly.get("freezing_level_height"), name="hourly.freezing_level_height")
+        if hourly.get("precipitation") is not None:
+            _validate_numeric_list(hourly.get("precipitation"), name="hourly.precipitation")
+    return data
+
+
+def _validate_glofas_payload(data: Any) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("GloFAS payload is not a JSON object")
+    daily = data.get("daily")
+    if not isinstance(daily, dict):
+        raise ValueError("GloFAS missing daily object")
+    times = daily.get("time")
+    if not isinstance(times, list) or len(times) < 14 or not all(isinstance(t, str) and t.strip() for t in times[:14]):
+        raise ValueError("GloFAS daily.time must have >= 14 date strings")
+    _validate_numeric_list(daily.get("river_discharge"), min_len=14, min_finite=1, name="daily.river_discharge")
+    if daily.get("river_discharge_mean") is not None:
+        _validate_numeric_list(daily.get("river_discharge_mean"), name="daily.river_discharge_mean")
+    if daily.get("river_discharge_max") is not None:
+        _validate_numeric_list(daily.get("river_discharge_max"), name="daily.river_discharge_max")
+    return data
+
+
+def _validate_usgs_payload(data: Any) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("USGS ComCat payload is not a JSON object")
+    features = data.get("features")
+    if not isinstance(features, list):
+        raise ValueError("USGS ComCat features must be a list")
+    for feat in features:
+        if not isinstance(feat, dict):
+            raise ValueError("USGS ComCat feature entry must be an object")
+        geom = feat.get("geometry")
+        if not isinstance(geom, dict):
+            raise ValueError("USGS ComCat feature missing geometry object")
+        coords = geom.get("coordinates")
+        if not isinstance(coords, list) or len(coords) < 2:
+            raise ValueError("USGS ComCat feature missing coordinate pair")
+        if _to_finite_float(coords[0]) is None or _to_finite_float(coords[1]) is None:
+            raise ValueError("USGS ComCat feature has non-finite coordinates")
+        if len(coords) > 2 and coords[2] is not None and _to_finite_float(coords[2]) is None:
+            raise ValueError("USGS ComCat feature has non-finite depth")
+        props = feat.get("properties")
+        if props is not None:
+            if not isinstance(props, dict):
+                raise ValueError("USGS ComCat feature properties must be an object")
+            if props.get("mag") is not None and _to_finite_float(props.get("mag")) is None:
+                raise ValueError("USGS ComCat feature has non-finite magnitude")
+            if props.get("time") is not None and _to_finite_float(props.get("time")) is None:
+                raise ValueError("USGS ComCat feature has non-finite timestamp")
+    return data
+
+
+def _summarize_sources(sources: set[str]) -> str:
+    if not sources:
+        return "offline_fallback"
+    if len(sources) == 1:
+        return next(iter(sources))
+    if "offline_fallback" in sources:
+        return "mixed (offline_fallback)"
+    stale = [s for s in sources if "stale" in s.lower()]
+    if stale:
+        return f"mixed ({stale[0]})"
+    return sorted(sources)[0]
 
 
 def _grid_key(lat: float, lon: float) -> str:
@@ -151,9 +264,7 @@ def _fetch_forecast_14d(lat: float, lon: float, lake_elev_m: float) -> tuple[dic
             timeout=_HTTP_TIMEOUT_SEC,
         )
         resp.raise_for_status()
-        data = resp.json()
-        if not (data.get("daily") or {}).get("time"):
-            raise ValueError("Open-Meteo Forecast returned empty daily series")
+        data = _validate_forecast_payload(resp.json())
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         with _TRIGGER_LOCK:
             _evict_if_full(_FORECAST_CACHE)
@@ -225,9 +336,7 @@ def _fetch_glofas_14d(lat: float, lon: float, basin_id: str) -> tuple[dict, str,
             timeout=_HTTP_TIMEOUT_SEC,
         )
         resp.raise_for_status()
-        data = resp.json()
-        if not (data.get("daily") or {}).get("time"):
-            raise ValueError("GloFAS returned empty daily series")
+        data = _validate_glofas_payload(resp.json())
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         with _TRIGGER_LOCK:
             _evict_if_full(_GLOFAS_CACHE)
@@ -269,7 +378,7 @@ def _fetch_usgs_events(lat: float, lon: float, *, force_regional: bool = False) 
     use_regional = force_regional or haversine_km(lat, lon, _REGIONAL_CENTER[0], _REGIONAL_CENTER[1]) <= 200.0
     if use_regional:
         key = _USGS_REGIONAL_KEY
-        q_lat, q_lon, q_rad = _REGIONAL_CENTER[0], _REGIONAL_CENTER[1], 350
+        q_lat, q_lon, q_rad = _REGIONAL_CENTER[0], _REGIONAL_CENTER[1], 420
     else:
         key = f"{_grid_key(lat, lon)}:150"
         q_lat, q_lon, q_rad = round(lat, 3), round(lon, 3), 150
@@ -308,9 +417,7 @@ def _fetch_usgs_events(lat: float, lon: float, *, force_regional: bool = False) 
             timeout=_HTTP_TIMEOUT_SEC,
         )
         resp.raise_for_status()
-        data = resp.json()
-        if "features" not in data:
-            raise ValueError("USGS ComCat missing features")
+        data = _validate_usgs_payload(resp.json())
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         with _TRIGGER_LOCK:
             _evict_if_full(_USGS_CACHE)
@@ -361,22 +468,24 @@ def _compute_triggers_from_raw(
     usgs_data: dict,
     usgs_source: str,
     usgs_fb: bool,
+    elev_fb: bool = False,
 ) -> dict[str, Any]:
     lat = float(lake.latitude)
     lon = float(lake.longitude)
 
     # 1. Thermal Melt Pillar
-    daily_f = forecast_data.get("daily") or {}
+    daily_f = forecast_data.get("daily") if isinstance(forecast_data.get("daily"), dict) else {}
     f_dates = list(daily_f.get("time") or [])
     tmax_raw = list(daily_f.get("temperature_2m_max") or [])
     tmin_raw = list(daily_f.get("temperature_2m_min") or [])
     precip_raw = list(daily_f.get("precipitation_sum") or [])
 
-    grid_elev_raw = forecast_data.get("elevation")
-    grid_elev = float(grid_elev_raw) if grid_elev_raw is not None else lake_elev_m
+    grid_elev = _to_finite_float(forecast_data.get("elevation"))
+    if grid_elev is None:
+        grid_elev = lake_elev_m
     delta_t = -0.0065 * (lake_elev_m - grid_elev)
 
-    hourly_f = forecast_data.get("hourly") or {}
+    hourly_f = forecast_data.get("hourly") if isinstance(forecast_data.get("hourly"), dict) else {}
     h_times = list(hourly_f.get("time") or [])
     h_fl = list(hourly_f.get("freezing_level_height") or [])
     h_precip = list(hourly_f.get("precipitation") or [])
@@ -384,11 +493,13 @@ def _compute_triggers_from_raw(
     fl_by_day: dict[str, list[float]] = {}
     for idx, ts in enumerate(h_times):
         day_str = str(ts)[:10]
-        if idx < len(h_fl) and h_fl[idx] is not None:
-            fl_by_day.setdefault(day_str, []).append(float(h_fl[idx]))
+        if idx < len(h_fl):
+            fl_val = _to_finite_float(h_fl[idx])
+            if fl_val is not None:
+                fl_by_day.setdefault(day_str, []).append(fl_val)
 
     max_hourly_precip_mm = max(
-        (float(p) for p in h_precip if p is not None),
+        (pv for p in h_precip if (pv := _to_finite_float(p)) is not None),
         default=0.0,
     )
 
@@ -396,23 +507,28 @@ def _compute_triggers_from_raw(
     adj_tmax_vals: list[float] = []
     daily_fl_means: dict[str, float] = {}
     for idx, d_str in enumerate(f_dates):
-        tx = float(tmax_raw[idx]) if idx < len(tmax_raw) and tmax_raw[idx] is not None else 0.0
-        tn = float(tmin_raw[idx]) if idx < len(tmin_raw) and tmin_raw[idx] is not None else tx
+        tx_val = _to_finite_float(tmax_raw[idx]) if idx < len(tmax_raw) else None
+        tx = tx_val if tx_val is not None else 0.0
+        tn_val = _to_finite_float(tmin_raw[idx]) if idx < len(tmin_raw) else None
+        tn = tn_val if tn_val is not None else tx
         tx_adj = tx + delta_t
         tn_adj = tn + delta_t
         adj_tmax_vals.append(tx_adj)
         pdd_14d += max(0.0, (tx_adj + tn_adj) / 2.0)
 
-        fl_vals = fl_by_day.get(d_str) or []
+        fl_vals = fl_by_day.get(str(d_str)) or []
         if fl_vals:
-            daily_fl_means[d_str] = sum(fl_vals) / len(fl_vals)
+            daily_fl_means[str(d_str)] = sum(fl_vals) / len(fl_vals)
 
     pdd_14d = round(pdd_14d, 1)
     all_fl_vals = list(daily_fl_means.values())
     freezing_level_m = round(sum(all_fl_vals) / len(all_fl_vals), 1) if all_fl_vals else round(lake_elev_m - 200.0, 1)
     above_lake_elevation = freezing_level_m > lake_elev_m
     max_temp_c = round(max(adj_tmax_vals, default=0.0), 1)
-    precip_7d_mm = round(sum(float(p) for p in precip_raw[-7:] if p is not None), 1)
+    precip_7d_mm = round(
+        sum(pv for p in precip_raw[-7:] if (pv := _to_finite_float(p)) is not None),
+        1,
+    )
 
     thermal_score = min(
         100.0,
@@ -425,18 +541,20 @@ def _compute_triggers_from_raw(
     )
 
     # 2. Hydrological GloFAS Pillar
-    daily_g = glofas_data.get("daily") or {}
+    daily_g = glofas_data.get("daily") if isinstance(glofas_data.get("daily"), dict) else {}
     g_dates = list(daily_g.get("time") or [])
     g_q = list(daily_g.get("river_discharge") or [])
     g_q_mean = list(daily_g.get("river_discharge_mean") or [])
 
     q_by_day: dict[str, float] = {}
     for idx, d_str in enumerate(g_dates):
-        if idx < len(g_q) and g_q[idx] is not None:
-            q_by_day[d_str] = float(g_q[idx])
+        if idx < len(g_q):
+            qv = _to_finite_float(g_q[idx])
+            if qv is not None:
+                q_by_day[str(d_str)] = qv
 
-    valid_q = [float(v) for v in g_q if v is not None]
-    valid_q_mean = [float(v) for v in g_q_mean if v is not None]
+    valid_q = [qv for v in g_q if (qv := _to_finite_float(v)) is not None]
+    valid_q_mean = [qv for v in g_q_mean if (qv := _to_finite_float(v)) is not None]
 
     discharge_m3s = round(max(valid_q, default=5.0), 2)
     mean_discharge_m3s = round(
@@ -454,21 +572,34 @@ def _compute_triggers_from_raw(
     # 3. Seismic USGS Pillar
     seismic_events: list[dict[str, Any]] = []
     pga_values: list[float] = []
-    for feat in (usgs_data.get("features") or []):
-        geom = feat.get("geometry") or {}
-        coords = geom.get("coordinates") or []
-        if len(coords) < 2:
+    raw_features = usgs_data.get("features") if isinstance(usgs_data.get("features"), list) else []
+    for feat in raw_features:
+        if not isinstance(feat, dict):
             continue
-        eq_lon, eq_lat = float(coords[0]), float(coords[1])
-        depth_km = float(coords[2]) if len(coords) > 2 and coords[2] is not None else 10.0
+        geom = feat.get("geometry")
+        if not isinstance(geom, dict):
+            continue
+        coords = geom.get("coordinates")
+        if not isinstance(coords, list) or len(coords) < 2:
+            continue
+        eq_lon = _to_finite_float(coords[0])
+        eq_lat = _to_finite_float(coords[1])
+        if eq_lon is None or eq_lat is None:
+            continue
+        depth_val = _to_finite_float(coords[2]) if len(coords) > 2 else None
+        depth_km = depth_val if depth_val is not None else 10.0
         dist_km = haversine_km(lat, lon, eq_lat, eq_lon)
         if dist_km > 150.0:
             continue
-        props = feat.get("properties") or {}
-        mag = float(props.get("mag") or 0.0)
-        t_ms = props.get("time")
+        props = feat.get("properties") if isinstance(feat.get("properties"), dict) else {}
+        mag_val = _to_finite_float(props.get("mag"))
+        mag = mag_val if mag_val is not None else 0.0
+        t_ms = _to_finite_float(props.get("time"))
         if t_ms is not None:
-            time_utc = datetime.fromtimestamp(float(t_ms) / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            try:
+                time_utc = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (OverflowError, OSError, ValueError):
+                time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         else:
             time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -520,12 +651,15 @@ def _compute_triggers_from_raw(
     # Build 14-day daily_series aligned to forecast dates
     daily_series: list[dict[str, Any]] = []
     for idx, d_str in enumerate(f_dates[:14]):
-        tx = float(tmax_raw[idx]) if idx < len(tmax_raw) and tmax_raw[idx] is not None else 0.0
-        pr = float(precip_raw[idx]) if idx < len(precip_raw) and precip_raw[idx] is not None else 0.0
-        fl_day = daily_fl_means.get(d_str, freezing_level_m)
-        q_day = q_by_day.get(d_str, discharge_m3s)
+        d_key = str(d_str)
+        tx_val = _to_finite_float(tmax_raw[idx]) if idx < len(tmax_raw) else None
+        pr_val = _to_finite_float(precip_raw[idx]) if idx < len(precip_raw) else None
+        tx = tx_val if tx_val is not None else 0.0
+        pr = pr_val if pr_val is not None else 0.0
+        fl_day = daily_fl_means.get(d_key, freezing_level_m)
+        q_day = q_by_day.get(d_key, discharge_m3s)
         daily_series.append({
-            "date": d_str,
+            "date": d_key,
             "temp_max_c": round(tx + delta_t, 1),
             "precip_mm": round(pr, 1),
             "freezing_level_m": round(fl_day, 1),
@@ -566,7 +700,7 @@ def _compute_triggers_from_raw(
             "open_meteo": om_source,
             "glofas": glofas_source,
             "usgs": usgs_source,
-            "fallback_used": bool(om_fb or glofas_fb or usgs_fb),
+            "fallback_used": bool(om_fb or glofas_fb or usgs_fb or elev_fb),
         },
     }
 
@@ -579,7 +713,14 @@ def get_lake_triggers(lake: LakeModel, db: Optional[Session] = None) -> dict[str
     lon = float(lake.longitude)
     basin = assign_basin(lat, lon)
 
-    elev_m = fetch_elevation_open_meteo(lat, lon)
+    if fetch_elevation_open_meteo is not _ORIG_FETCH_ELEV:
+        elev_m = fetch_elevation_open_meteo(lat, lon)
+        elev_fb = elev_m is None
+    else:
+        elevs, elev_source = fetch_elevations_batch([(lat, lon)])
+        elev_m = elevs[0] if elevs else None
+        elev_fb = (elev_m is None) or ("stale" in elev_source.lower()) or ("offline" in elev_source.lower())
+
     lake_elev_m = float(elev_m) if elev_m is not None else 3850.0
 
     forecast_data, om_source, om_fb = _fetch_forecast_14d(lat, lon, lake_elev_m)
@@ -598,6 +739,7 @@ def get_lake_triggers(lake: LakeModel, db: Optional[Session] = None) -> dict[str
         usgs_data=usgs_data,
         usgs_source=usgs_source,
         usgs_fb=usgs_fb,
+        elev_fb=elev_fb,
     )
 
 
@@ -605,32 +747,37 @@ def get_regional_triggers(db: Session) -> dict[str, Any]:
     lakes = db.query(LakeModel).all()
     geo_lakes = [l for l in lakes if l.latitude is not None and l.longitude is not None]
 
-    # Pre-warm USGS regional feed once for all lakes
+    # Pre-warm USGS regional feed & batch-fetch all lake elevations in ONE HTTP call
     usgs_data, usgs_source, usgs_fb = _fetch_usgs_events(
         _REGIONAL_CENTER[0],
         _REGIONAL_CENTER[1],
         force_regional=True,
     )
+    elevs, elev_source = fetch_elevations_batch(
+        [(float(l.latitude), float(l.longitude)) for l in geo_lakes]
+    )
+    elev_stale_or_offline = ("stale" in elev_source.lower()) or ("offline" in elev_source.lower())
 
     items: list[dict[str, Any]] = []
     counts = {"Critical": 0, "Warning": 0, "Watch": 0, "Normal": 0}
-    any_fb = usgs_fb
+    any_fb = usgs_fb or elev_stale_or_offline
     om_sources: set[str] = set()
     glofas_sources: set[str] = set()
 
-    for lake in geo_lakes:
+    for idx, lake in enumerate(geo_lakes):
         lat = float(lake.latitude)
         lon = float(lake.longitude)
         basin = assign_basin(lat, lon)
-        elev_m = fetch_elevation_open_meteo(lat, lon)
+        elev_m = elevs[idx] if idx < len(elevs) else None
         lake_elev_m = float(elev_m) if elev_m is not None else 3850.0
+        elev_fb = (elev_m is None) or elev_stale_or_offline
 
         # Grid-coalesced 0.5° Forecast & GloFAS caches keep this to ~6-8 calls total
         forecast_data, om_source, om_fb = _fetch_forecast_14d(lat, lon, lake_elev_m)
         glofas_data, glofas_source, glofas_fb = _fetch_glofas_14d(lat, lon, basin["id"])
         om_sources.add(om_source)
         glofas_sources.add(glofas_source)
-        any_fb = any_fb or om_fb or glofas_fb
+        any_fb = any_fb or elev_fb or om_fb or glofas_fb
 
         res = _compute_triggers_from_raw(
             lake=lake,
@@ -644,6 +791,7 @@ def get_regional_triggers(db: Session) -> dict[str, Any]:
             usgs_data=usgs_data,
             usgs_source=usgs_source,
             usgs_fb=usgs_fb,
+            elev_fb=elev_fb,
         )
         lvl = res["trigger_level"]
         if lvl in counts:
@@ -669,8 +817,8 @@ def get_regional_triggers(db: Session) -> dict[str, Any]:
         "top_alerts": items[:5],
         "lakes": items,
         "provenance": {
-            "open_meteo": sorted(om_sources)[0] if om_sources else "offline_fallback",
-            "glofas": sorted(glofas_sources)[0] if glofas_sources else "offline_fallback",
+            "open_meteo": _summarize_sources(om_sources),
+            "glofas": _summarize_sources(glofas_sources),
             "usgs": usgs_source,
             "fallback_used": any_fb,
         },

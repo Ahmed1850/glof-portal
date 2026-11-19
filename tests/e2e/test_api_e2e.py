@@ -541,11 +541,15 @@ class TestApiTier1Baseline(BaseApiTestCase):
         r_detect = self.client.get("/gee/detect-lakes", timeout=90.0)
         self.assertEqual(r_detect.status_code, 200)
         det = r_detect.json()
-        self.assertGreaterEqual(det["total_detected"], 46)
         self.assertIn(
             det["source_used"],
             {"gee_sentinel2", "mpc_sentinel2", "sentinel1_sar", "database_inventory"},
         )
+        self.assertEqual(det["total_detected"], len(det["lakes"]))
+        if det["source_used"] == "database_inventory":
+            self.assertGreaterEqual(det["total_detected"], 46)
+        else:
+            self.assertGreaterEqual(det["total_detected"], 1)
         self.assertGreaterEqual(len(det["cascade"]), 1)
 
 

@@ -5,10 +5,11 @@ batch coordinate querying, and passive provider telemetry.
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -23,6 +24,16 @@ _ELEV_MAX_ENTRIES = 1000
 
 _OPEN_METEO_ELEV_URL = "https://api.open-meteo.com/v1/elevation"
 _HEADERS = {"User-Agent": "GLOF-Portal/1.0 (elevation; educational)"}
+
+
+def _to_finite_float(val: Any) -> Optional[float]:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _elev_key(lat: float, lon: float) -> str:
@@ -41,19 +52,23 @@ def get_cached_elevation(lat: Optional[float], lon: Optional[float]) -> Optional
     with _ELEV_LOCK:
         hit = _ELEV_CACHE.get(key)
         if hit and now - hit[0] <= _ELEV_STALE_SEC:
-            return float(hit[1])
+            return _to_finite_float(hit[1])
     return None
 
 
 def _store_elevations(items: list[tuple[str, float]]) -> int:
+    clean = [(k, f) for k, v in items if (f := _to_finite_float(v)) is not None]
+    if not clean:
+        with _ELEV_LOCK:
+            return len(_ELEV_CACHE)
     now = time.time()
     with _ELEV_LOCK:
-        if len(_ELEV_CACHE) + len(items) > _ELEV_MAX_ENTRIES:
-            oldest = sorted(_ELEV_CACHE.items(), key=lambda kv: kv[1][0])[: max(100, len(items))]
+        if len(_ELEV_CACHE) + len(clean) > _ELEV_MAX_ENTRIES:
+            oldest = sorted(_ELEV_CACHE.items(), key=lambda kv: kv[1][0])[: max(100, len(clean))]
             for k, _ in oldest:
                 _ELEV_CACHE.pop(k, None)
-        for key, val in items:
-            _ELEV_CACHE[key] = (now, float(val))
+        for key, val in clean:
+            _ELEV_CACHE[key] = (now, val)
         return len(_ELEV_CACHE)
 
 
@@ -91,24 +106,28 @@ def fetch_elevation_open_meteo(lat: float, lon: float) -> Optional[float]:
         )
         resp.raise_for_status()
         data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError("Open-Meteo elevation returned non-dict JSON")
         elev = data.get("elevation")
         val: Optional[float] = None
-        if isinstance(elev, list) and elev and elev[0] is not None:
-            val = float(elev[0])
-        elif elev is not None and not isinstance(elev, list):
-            val = float(elev)
+        if isinstance(elev, list) and elev:
+            val = _to_finite_float(elev[0])
+        elif not isinstance(elev, list):
+            val = _to_finite_float(elev)
+
+        if val is None:
+            raise ValueError("Open-Meteo elevation missing finite numeric value")
 
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-        if val is not None:
-            n_entries = _store_elevations([(key, val)])
-            record_provider_event(
-                "Open-Meteo Elevation",
-                status="healthy",
-                latency_ms=latency_ms,
-                cached_entries=n_entries,
-                fallback_mode="stale cache -> Open-Elevation -> alpine slope heuristic",
-            )
-            return val
+        n_entries = _store_elevations([(key, val)])
+        record_provider_event(
+            "Open-Meteo Elevation",
+            status="healthy",
+            latency_ms=latency_ms,
+            cached_entries=n_entries,
+            fallback_mode="stale cache -> Open-Elevation -> alpine slope heuristic",
+        )
+        return val
     except Exception as e:
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         with _ELEV_LOCK:
@@ -122,7 +141,7 @@ def fetch_elevation_open_meteo(lat: float, lon: float) -> Optional[float]:
                 fallback_mode="stale_cache",
                 error=str(e),
             )
-            return float(stale[1])
+            return _to_finite_float(stale[1])
         record_provider_event(
             "Open-Meteo Elevation",
             status="degraded",
@@ -133,8 +152,6 @@ def fetch_elevation_open_meteo(lat: float, lon: float) -> Optional[float]:
         )
         print(f"Open-Meteo elevation failed for {lat},{lon}: {e}")
         return None
-
-    return float(stale[1]) if stale is not None else None
 
 
 def fetch_elevations_batch(
@@ -190,30 +207,37 @@ def fetch_elevations_batch(
         )
         resp.raise_for_status()
         data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError("Open-Meteo elevation returned non-dict JSON")
         elevs = data.get("elevation")
         if not isinstance(elevs, list):
             elevs = [elevs]
 
         to_store: list[tuple[str, float]] = []
+        used_stale = False
         for pos, orig_idx in enumerate(missing_indices):
             raw_v = elevs[pos] if pos < len(elevs) else None
-            if raw_v is not None:
-                val = float(raw_v)
+            val = _to_finite_float(raw_v)
+            if val is not None:
                 results[orig_idx] = val
                 to_store.append((missing_keys[pos], val))
             elif orig_idx in stale_map:
                 results[orig_idx] = stale_map[orig_idx]
+                used_stale = True
+
+        if not to_store:
+            raise ValueError("Open-Meteo elevation batch returned no finite values")
 
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-        new_count = _store_elevations(to_store) if to_store else n_entries
+        new_count = _store_elevations(to_store)
         record_provider_event(
             "Open-Meteo Elevation",
-            status="healthy",
+            status="degraded" if used_stale else "healthy",
             latency_ms=latency_ms,
             cached_entries=new_count,
-            fallback_mode="stale cache -> Open-Elevation -> alpine slope heuristic",
+            fallback_mode="stale_cache" if used_stale else "stale cache -> Open-Elevation -> alpine slope heuristic",
         )
-        return results, "Open-Meteo Elevation"
+        return results, ("Open-Meteo Elevation (partial stale cache)" if used_stale else "Open-Meteo Elevation")
     except Exception as e:
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         used_stale = False
