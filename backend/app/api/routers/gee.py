@@ -21,6 +21,7 @@ from app.utils.gee_detection import (
     gee_status,
 )
 from app.services.satellite_cascade import detect_lakes_cascade, cascade_status
+from app.services.provider_telemetry import register_cache_counter
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -34,6 +35,8 @@ _PNG_CACHE: dict[str, tuple[float, bytes, str]] = {}
 _PNG_LOCK = threading.Lock()
 _PNG_TTL_SEC = 20 * 60  # 20 minutes
 _PNG_MAX_ENTRIES = 120
+
+register_cache_counter("GEE", lambda: len(_PNG_CACHE))
 
 
 def _gee_http_error(e: Exception) -> HTTPException:

@@ -26,6 +26,10 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal, get_db
 from app.models.lake import Lake as LakeModel
 from app.services.early_warning import compute_early_warning, classify_level
+from app.services.elevation_service import (
+    fetch_elevation_open_meteo,
+    fetch_elevations_batch,
+)
 from app.services.flood_impact import (
     build_flood_impact,
     predict_flood_likelihood,
@@ -33,6 +37,7 @@ from app.services.flood_impact import (
     fetch_current_weather,
 )
 from app.services.glof_basins import BASINS, assign_basin, basin_summary_for_lakes, estimate_outburst_volume_m3
+from app.services.provider_telemetry import record_provider_event, register_cache_counter
 from app.utils.gee_detection import GEE_READY, _init_ee, gee_status
 
 limiter = Limiter(key_func=get_remote_address)
@@ -47,6 +52,8 @@ _CACHE_LOCK = threading.Lock()
 _GROWTH_CACHE: dict[str, tuple[float, Optional[float]]] = {}
 _POP_CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL_SEC = float(os.getenv("EW_GEE_CACHE_TTL_SEC", str(6 * 3600)))  # 6h
+
+register_cache_counter("GEE", lambda: len(_GROWTH_CACHE) + len(_POP_CACHE))
 
 # Background monitor jobs (bypass Render HTTP proxy timeout on long GEE scans)
 _JOBS_LOCK = threading.Lock()
@@ -117,21 +124,6 @@ def _http_get_json(url: str, timeout: float = 8.0) -> dict:
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
-
-
-def fetch_elevation_open_meteo(lat: float, lon: float) -> Optional[float]:
-    """Open-Meteo elevation API (no key)."""
-    try:
-        qs = urllib.parse.urlencode({"latitude": lat, "longitude": lon})
-        data = _http_get_json(f"https://api.open-meteo.com/v1/elevation?{qs}", timeout=6.0)
-        elev = data.get("elevation")
-        if isinstance(elev, list) and elev:
-            return float(elev[0])
-        if elev is not None:
-            return float(elev)
-    except Exception as e:
-        print(f"Open-Meteo elevation failed for {lat},{lon}: {e}")
-    return None
 
 
 def fetch_elevation_open_elevation(lat: float, lon: float) -> Optional[float]:
@@ -211,6 +203,7 @@ def fetch_growth_from_gee(lat: float, lon: float) -> tuple[Optional[float], Opti
 
     if not GEE_READY and not _init_ee():
         return None, None
+    t0 = time.perf_counter()
     try:
         from app.utils.gee_detection import estimate_growth_pct_per_year
         res = estimate_growth_pct_per_year(lat, lon, year_start=2019, year_end=2024)
@@ -221,8 +214,19 @@ def fetch_growth_from_gee(lat: float, lon: float) -> tuple[Optional[float], Opti
             "GEE growth unavailable" if growth is None else "GEE hybrid growth"
         )
         _cache_set(_GROWTH_CACHE, key, (growth, source))
+        record_provider_event(
+            "GEE",
+            status="healthy" if growth is not None else "degraded",
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+        )
         return growth, source
     except Exception as e:
+        record_provider_event(
+            "GEE",
+            status="degraded",
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            error=str(e),
+        )
         return None, f"GEE growth error: {e}"
 
 
@@ -254,20 +258,30 @@ def fetch_population_exposure(lat: float, lon: float, area_ha: Optional[float]) 
 
     if not GEE_READY and not _init_ee():
         return _population_heuristic(lat, lon, area_ha)
+    t0 = time.perf_counter()
     try:
         from app.utils.gee_detection import estimate_lake_exposure
         res = estimate_lake_exposure(lat, lon, risk)
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         # If GEE returns zeros/errors, still provide heuristic floor for UX
         if res.get("error") or (
             int(res.get("danger_population") or 0) == 0
             and int(res.get("warning_population") or 0) == 0
         ):
+            record_provider_event("GEE", status="degraded", latency_ms=latency_ms, error=res.get("error"))
             h = _population_heuristic(lat, lon, area_ha)
             h["source"] = f"heuristic (GEE empty/error: {res.get('error') or 'zero pop'})"
             return h
+        record_provider_event("GEE", status="healthy", latency_ms=latency_ms)
         _cache_set(_POP_CACHE, key, res)
         return res
     except Exception as e:
+        record_provider_event(
+            "GEE",
+            status="degraded",
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            error=str(e),
+        )
         h = _population_heuristic(lat, lon, area_ha)
         h["source"] = f"heuristic (GEE error: {e})"
         return h

@@ -831,6 +831,12 @@ _THUMB_URL_CACHE: dict[str, tuple[float, dict]] = {}
 _THUMB_URL_LOCK = threading.Lock()
 _THUMB_URL_TTL_SEC = float(os.getenv("THUMB_URL_CACHE_TTL_SEC", str(20 * 60)))  # 20 min
 
+try:
+    from app.services.provider_telemetry import register_cache_counter as _register_cache_counter
+    _register_cache_counter("GEE", lambda: len(_THUMB_URL_CACHE))
+except Exception:
+    pass
+
 
 def _thumb_cache_key(lat: float, lon: float, buffer_m: float, mode: str) -> str:
     return f"{round(float(lat), 4)}:{round(float(lon), 4)}:{int(buffer_m)}:{(mode or 'ndwi').lower()}"

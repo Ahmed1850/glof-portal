@@ -15,6 +15,7 @@ from app.api.routers.gee import router as gee_router
 from app.api.routers.auth import router as auth_router
 from app.api.routers.early_warning import router as early_warning_router
 from app.api.routers.reports import router as reports_router
+from app.api.routers.analytics import router as analytics_router
 from app.db.base import Base
 from app.db.session import engine, SessionLocal
 
@@ -90,6 +91,7 @@ app.include_router(gee_router)
 app.include_router(auth_router)
 app.include_router(early_warning_router)
 app.include_router(reports_router)
+app.include_router(analytics_router)
 
 
 def _seed_and_backfill_geometries():
@@ -158,7 +160,8 @@ def _warm_weather_cache():
         print(f"Weather warm skipped: {e}")
 
 
-_warm_weather_cache()
+if os.getenv("WARM_WEATHER_ON_START", "1") in ("1", "true", "True", "yes"):
+    _warm_weather_cache()
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -214,7 +217,7 @@ if STATIC_DIR.is_dir():
 
     @app.get("/{full_path:path}")
     def spa_fallback(full_path: str):
-        if full_path.startswith(("lakes", "gee", "risk", "reports", "auth", "early-warning", "docs", "openapi", "redoc", "health", "api", "assets", "weather")):
+        if full_path.startswith(("lakes", "gee", "risk", "reports", "analytics", "auth", "early-warning", "docs", "openapi", "redoc", "health", "api", "assets", "weather")):
             return JSONResponse({"detail": "Not found"}, status_code=404)
         candidate = STATIC_DIR / full_path
         if candidate.is_file():

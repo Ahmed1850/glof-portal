@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+from app.services.provider_telemetry import record_provider_event
 
 # Gilgit–Baltistan glacial lake ROI (lon_min, lat_min, lon_max, lat_max)
 DEFAULT_BBOX = (73.5, 35.2, 76.8, 37.2)
@@ -64,9 +67,12 @@ def _http_post_json(url: str, body: dict, timeout: float = 60.0) -> dict:
 
 def mpc_status() -> dict:
     """Lightweight health probe for /gee/status cascade panel."""
+    t0 = time.perf_counter()
     try:
         landing = _http_get_json(f"{PC_STAC_URL}/", timeout=12.0)
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         title = landing.get("title") or landing.get("id") or "planetary-computer"
+        record_provider_event("Planetary Computer", status="healthy", latency_ms=latency_ms)
         return {
             "ready": True,
             "endpoint": PC_STAC_URL,
@@ -74,6 +80,8 @@ def mpc_status() -> dict:
             "error": None,
         }
     except Exception as e:
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        record_provider_event("Planetary Computer", status="offline", latency_ms=latency_ms, error=str(e))
         return {
             "ready": False,
             "endpoint": PC_STAC_URL,
@@ -109,9 +117,14 @@ def search_sentinel2_scenes(
         "sortby": [{"field": "eo:cloud_cover", "direction": "asc"}],
     }
 
+    t0 = time.perf_counter()
     try:
         result = _http_post_json(f"{PC_STAC_URL}/search", body, timeout=60.0)
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        record_provider_event("Planetary Computer", status="healthy", latency_ms=latency_ms)
     except Exception as e:
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        record_provider_event("Planetary Computer", status="degraded", latency_ms=latency_ms, error=str(e))
         return {
             "ok": False,
             "reason": f"MPC STAC search failed: {e}",

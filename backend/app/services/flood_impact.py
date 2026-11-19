@@ -21,6 +21,7 @@ from app.services.glof_basins import (
     estimate_flood_footprint,
     estimate_outburst_volume_m3,
 )
+from app.services.provider_telemetry import record_provider_event, register_cache_counter
 from app.utils.risk import calculate_risk
 
 # ---------------------------------------------------------------------------
@@ -31,6 +32,8 @@ _TEMP_LOCK = threading.Lock()
 _TEMP_CACHE: dict[str, tuple[float, dict]] = {}
 _TEMP_TTL_SEC = float(os.getenv("WEATHER_CACHE_TTL_SEC", str(45 * 60)))  # 45 min
 _TEMP_STALE_SEC = float(os.getenv("WEATHER_STALE_SEC", str(6 * 3600)))  # serve stale up to 6h on errors
+
+register_cache_counter("Open-Meteo Weather", lambda: len(_TEMP_CACHE))
 
 
 def _temp_cache_key(lat: float, lon: float) -> str:
@@ -249,17 +252,34 @@ def fetch_current_weather(lat: float, lon: float) -> dict:
         if hit and now - hit[0] <= _TEMP_TTL_SEC:
             out = dict(hit[1])
             out["cached"] = True
+            record_provider_event(
+                "Open-Meteo Weather",
+                status="healthy",
+                cached_entries=len(_TEMP_CACHE),
+                cache_hit=True,
+            )
             return out
         stale = hit  # may reuse if providers fail
 
     errors: list[str] = []
     for provider in (_fetch_open_meteo, _fetch_met_no, _fetch_wttr):
+        t0 = time.perf_counter()
         try:
             result = provider(float(lat), float(lon))
             if result.get("temperature_c") is None and result.get("forecast_max_c") is None:
                 continue
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
             with _TEMP_LOCK:
                 _TEMP_CACHE[key] = (time.time(), dict(result))
+                n_entries = len(_TEMP_CACHE)
+            src = str(result.get("source") or "Open-Meteo")
+            record_provider_event(
+                "Open-Meteo Weather",
+                status="healthy" if src == "Open-Meteo" else "degraded",
+                latency_ms=latency_ms,
+                cached_entries=n_entries,
+                fallback_mode="MET Norway -> wttr.in -> stale cache" if src == "Open-Meteo" else f"fallback:{src}",
+            )
             result = dict(result)
             result["cached"] = False
             return result
@@ -268,12 +288,30 @@ def fetch_current_weather(lat: float, lon: float) -> dict:
 
     # Serve slightly stale cache rather than blank UI on 429 storms
     if stale and now - stale[0] <= _TEMP_STALE_SEC:
+        with _TEMP_LOCK:
+            n_entries = len(_TEMP_CACHE)
+        record_provider_event(
+            "Open-Meteo Weather",
+            status="degraded",
+            cached_entries=n_entries,
+            fallback_mode="stale_cache",
+            error="; ".join(errors[-2:]) if errors else None,
+        )
         out = dict(stale[1])
         out["cached"] = True
         out["source"] = f"{out.get('source', 'cache')} (stale cache; live fetch failed)"
         out["fetch_errors"] = errors[-3:]
         return out
 
+    with _TEMP_LOCK:
+        n_entries = len(_TEMP_CACHE)
+    record_provider_event(
+        "Open-Meteo Weather",
+        status="offline",
+        cached_entries=n_entries,
+        fallback_mode="unavailable",
+        error="; ".join(errors[-2:]) if errors else "no provider",
+    )
     empty = _weather_payload(
         temperature_c=None,
         source="unavailable: " + ("; ".join(errors[-2:]) if errors else "no provider"),
