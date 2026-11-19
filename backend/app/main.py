@@ -14,19 +14,21 @@ from app.api.routers.risk import router as risk_router
 from app.api.routers.gee import router as gee_router
 from app.api.routers.auth import router as auth_router
 from app.api.routers.early_warning import router as early_warning_router
+from app.api.routers.reports import router as reports_router
 from app.db.base import Base
-from app.db.session import engine
+from app.db.session import engine, SessionLocal
 
 # IMPORTANT: import models so tables are registered
 from app.models.lake import Lake, KnownLake  # noqa: F401
+from app.models.audit import AuditLog
 
 # ---------- Rate Limiter Setup ----------
 limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="GLOF Portal API",
-    version="1.0",
-    description="Glacial Lake Outburst Flood Monitoring System"
+    version="1.1",
+    description="Glacial Lake Outburst Flood Monitoring & Geospatial Intelligence System"
 )
 
 # Attach limiter to the app
@@ -42,7 +44,6 @@ _default_origins = [
 ]
 _extra = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 allow_origins = list(dict.fromkeys(_default_origins + _extra)) or _default_origins
-# Star cannot be used with credentials
 _allow_credentials = True
 if "*" in allow_origins:
     allow_origins = ["*"]
@@ -57,20 +58,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.models.audit import AuditLog
-from app.db.session import SessionLocal
 
 # Middleware for audit logging
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    # Only log mutating requests (POST, PUT, DELETE)
     if request.method in ["POST", "PUT", "DELETE"]:
         db = SessionLocal()
         try:
+            client_host = request.client.host if request.client else "unknown"
             audit_log = AuditLog(
-                user_id="unknown",  # Need to extract from token later
+                user_id="unknown",
                 action=f"{request.method} {request.url.path}",
-                ip_address=request.client.host
+                ip_address=client_host,
             )
             db.add(audit_log)
             db.commit()
@@ -80,13 +79,8 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     return response
 
-import socketio
 
-# Setup for real-time alerting
-sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
-sio_app = socketio.ASGIApp(sio, app)
-
-# Create tables (now includes known_lakes)
+# Create tables (includes known_lakes)
 Base.metadata.create_all(bind=engine)
 
 # Include routers
@@ -95,19 +89,19 @@ app.include_router(risk_router)
 app.include_router(gee_router)
 app.include_router(auth_router)
 app.include_router(early_warning_router)
+app.include_router(reports_router)
 
 
-def _seed_if_empty():
-    """Populate lakes on free hosting restarts when DB is empty."""
-    if os.getenv("SEED_ON_START", "0") not in ("1", "true", "True", "yes"):
-        return
+def _seed_and_backfill_geometries():
+    """Populate lakes when DB is empty and backfill missing WKT POINT(lon lat) geometries."""
     from app.api.routers.lakes import KNOWN_LAKES_SEED
     from app.utils.risk import calculate_risk
     from app.models.lake import Lake as LakeModel, KnownLake as KnownLakeModel
 
     db = SessionLocal()
     try:
-        if db.query(LakeModel).count() == 0:
+        should_seed = os.getenv("SEED_ON_START", "1") in ("1", "true", "True", "yes")
+        if should_seed and db.query(LakeModel).count() == 0:
             for item in KNOWN_LAKES_SEED:
                 risk = calculate_risk(item.get("area_ha") or 0)
                 db.add(LakeModel(
@@ -119,7 +113,7 @@ def _seed_if_empty():
                     geom=f"POINT({item['longitude']} {item['latitude']})",
                 ))
             db.commit()
-        if db.query(KnownLakeModel).count() == 0:
+        if should_seed and db.query(KnownLakeModel).count() == 0:
             for item in KNOWN_LAKES_SEED:
                 db.add(KnownLakeModel(
                     name=item["name"],
@@ -128,16 +122,30 @@ def _seed_if_empty():
                     area_ha=item.get("area_ha"),
                     district=item.get("district"),
                     source="manual",
+                    geom=f"POINT({item['longitude']} {item['latitude']})",
                 ))
+            db.commit()
+
+        # Backfill missing WKT geom strings on existing rows
+        updated = 0
+        for row in db.query(LakeModel).filter(LakeModel.geom.is_(None)).all():
+            if row.latitude is not None and row.longitude is not None:
+                row.geom = f"POINT({row.longitude} {row.latitude})"
+                updated += 1
+        for row in db.query(KnownLakeModel).filter(KnownLakeModel.geom.is_(None)).all():
+            if row.latitude is not None and row.longitude is not None:
+                row.geom = f"POINT({row.longitude} {row.latitude})"
+                updated += 1
+        if updated:
             db.commit()
     except Exception as e:
         db.rollback()
-        print(f"Seed skipped: {e}")
+        print(f"Seed/backfill skipped: {e}")
     finally:
         db.close()
 
 
-_seed_if_empty()
+_seed_and_backfill_geometries()
 
 
 def _warm_weather_cache():
@@ -152,7 +160,6 @@ def _warm_weather_cache():
 
 _warm_weather_cache()
 
-# Optional SPA bundle (built frontend copied to backend/static for single-service host)
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
@@ -169,10 +176,6 @@ def weather_root(
     lat: float = 35.92,
     lon: float = 74.31,
 ):
-    """
-    Dashboard weather (same payload as /early-warning/weather).
-    Short path used by the SPA so temperature never depends on a nested route only.
-    """
     from app.services.flood_impact import fetch_current_weather
     w = fetch_current_weather(lat, lon)
     return {
@@ -211,8 +214,7 @@ if STATIC_DIR.is_dir():
 
     @app.get("/{full_path:path}")
     def spa_fallback(full_path: str):
-        """Serve built React app for client-side routes (API routes take priority)."""
-        if full_path.startswith(("lakes", "gee", "risk", "auth", "early-warning", "docs", "openapi", "redoc", "health", "api", "assets", "weather")):
+        if full_path.startswith(("lakes", "gee", "risk", "reports", "auth", "early-warning", "docs", "openapi", "redoc", "health", "api", "assets", "weather")):
             return JSONResponse({"detail": "Not found"}, status_code=404)
         candidate = STATIC_DIR / full_path
         if candidate.is_file():

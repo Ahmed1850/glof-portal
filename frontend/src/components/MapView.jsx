@@ -1,8 +1,19 @@
 import { useState, useEffect } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, GeoJSON, Circle } from 'react-leaflet';
+import {
+  MapContainer,
+  TileLayer,
+  Marker,
+  Popup,
+  GeoJSON,
+  Circle,
+  Polyline,
+  CircleMarker,
+  useMapEvents,
+} from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import { IconSatellite, IconMoon, IconMap, IconGlobe } from './Icons';
+import { IconSatellite, IconMoon, IconMap, IconGlobe, IconMountain, IconDownload } from './Icons';
+import { API_BASE } from '../api';
 
 // Fix default Leaflet marker icons
 delete L.Icon.Default.prototype._getIconUrl;
@@ -13,7 +24,10 @@ L.Icon.Default.mergeOptions({
 });
 
 // ==================== RISK CALCULATION ====================
-const getRisk = (area) => {
+const getRisk = (area, explicitRisk) => {
+  if (explicitRisk && ['High', 'Medium', 'Low'].includes(explicitRisk)) {
+    return explicitRisk;
+  }
   if (area >= 20) return 'High';
   if (area >= 10) return 'Medium';
   return 'Low';
@@ -81,6 +95,12 @@ const MAP_LAYERS = {
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
     attribution: '&copy; Esri',
   },
+  topo: {
+    name: 'Topo Terrain',
+    IconComponent: IconMountain,
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
+    attribution: '&copy; Esri &copy; USGS',
+  },
   dark: {
     name: 'Dark',
     IconComponent: IconMoon,
@@ -106,6 +126,21 @@ const districtsStyle = {
   fillOpacity: 0.16,
 };
 
+// ==================== GIS TELEMETRY & CLICK HANDLER ====================
+const MapInteractionEvents = ({ onCursorMove, spatialMode, onSpatialClick }) => {
+  useMapEvents({
+    mousemove(e) {
+      onCursorMove({ lat: e.latlng.lat, lon: e.latlng.lng });
+    },
+    click(e) {
+      if (spatialMode) {
+        onSpatialClick({ lat: e.latlng.lat, lon: e.latlng.lng });
+      }
+    },
+  });
+  return null;
+};
+
 // ==================== MAIN COMPONENT ====================
 const MapView = ({
   selectedRisk,
@@ -113,7 +148,6 @@ const MapView = ({
   lakes,
   setSelectedLake,
   loading,
-  // New props for Population tab
   showZones = false,
   defaultShowDanger = true,
   defaultShowWarning = true,
@@ -127,11 +161,20 @@ const MapView = ({
     districts: true,
     danger: defaultShowDanger,
     warning: defaultShowWarning,
+    corridor: true,
   });
 
   const [provincialData, setProvincialData] = useState(null);
   const [districtsData, setDistrictsData] = useState(null);
   const [loadError, setLoadError] = useState(null);
+
+  // Advanced GIS States: Cursor Telemetry, Flood Corridor Trace, Spatial Proximity Search
+  const [cursorCoords, setCursorCoords] = useState({ lat: 36.2, lon: 74.5 });
+  const [corridorData, setCorridorData] = useState(null);
+  const [corridorLoadingId, setCorridorLoadingId] = useState(null);
+  const [spatialMode, setSpatialMode] = useState(false);
+  const [spatialResult, setSpatialResult] = useState(null);
+  const [spatialRadiusKm, setSpatialRadiusKm] = useState(35);
 
   useEffect(() => {
     fetch('/geo/glof_provincial_boundary.geojson')
@@ -155,6 +198,53 @@ const MapView = ({
     setLayers((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
+  const traceFloodCorridor = async (lakeId) => {
+    if (!lakeId) return;
+    setCorridorLoadingId(lakeId);
+    try {
+      const res = await fetch(`${API_BASE}/lakes/${lakeId}/flood-corridor`);
+      if (!res.ok) throw new Error(`Corridor trace failed (${res.status})`);
+      const data = await res.json();
+      setCorridorData(data);
+      setLayers((prev) => ({ ...prev, corridor: true }));
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setCorridorLoadingId(null);
+    }
+  };
+
+  const runSpatialSearch = async ({ lat, lon }) => {
+    try {
+      const url = `${API_BASE}/lakes/spatial-search?lat=${lat}&lon=${lon}&radius_km=${spatialRadiusKm}&risk_level=${selectedRisk}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Spatial query failed (${res.status})`);
+      const data = await res.json();
+      setSpatialResult({ center: { lat, lon }, radiusKm: spatialRadiusKm, ...data });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const exportGeoJSON = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/lakes/geojson?risk_level=${selectedRisk}`);
+      if (!res.ok) throw new Error('GeoJSON export failed');
+      const geojson = await res.json();
+      const blob = new Blob([JSON.stringify(geojson, null, 2)], { type: 'application/geo+json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `glof_lakes_${(selectedRisk || 'all').toLowerCase()}.geojson`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   const onEachDistrict = (feature, layer) => {
     const name = feature.properties?.adm2_name || feature.properties?.name || 'Unknown District';
     const province = feature.properties?.adm1_name || '';
@@ -169,7 +259,13 @@ const MapView = ({
   const filteredLakes =
     selectedRisk === 'All'
       ? lakes
-      : lakes.filter((lake) => getRisk(lake.area_ha) === selectedRisk);
+      : lakes.filter((lake) => getRisk(lake.area_ha, lake.risk_level) === selectedRisk);
+
+  // Extract parsed LineStrings & storage nodes from active flood corridor GeoJSON
+  const corridorFeatures = corridorData?.features || [];
+  const downstreamLine = corridorFeatures.find((f) => f.properties?.layer === 'downstream_corridor');
+  const glacierLine = corridorFeatures.find((f) => f.properties?.layer === 'glacier_feeder');
+  const storageNodes = corridorFeatures.filter((f) => f.properties?.layer === 'storage_node');
 
   if (loading) {
     return (
@@ -240,8 +336,47 @@ const MapView = ({
           })}
         </div>
 
-        {/* Right controls */}
-        <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+        {/* Right controls: Spatial Radius Query, GeoJSON Export, Layers, Basemaps */}
+        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+          <button
+            onClick={() => {
+              setSpatialMode((prev) => !prev);
+              if (spatialMode) setSpatialResult(null);
+            }}
+            className="btn-3d"
+            title="Click anywhere on the map to find lakes within 35 km radius"
+            style={{
+              display: 'flex', alignItems: 'center', gap: '7px',
+              padding: '8px 14px', borderRadius: '10px',
+              border: spatialMode ? '1px solid rgba(236,72,153,0.5)' : '1px solid var(--line, #dbe4ec)',
+              background: spatialMode ? 'rgba(236,72,153,0.14)' : 'transparent',
+              color: spatialMode ? '#f472b6' : '#8ea3ba',
+              fontWeight: 700, fontSize: '12.5px', cursor: 'pointer',
+              fontFamily: 'var(--font-display, inherit)',
+            }}
+          >
+            <span>🎯</span>
+            {spatialMode ? `Radius Query (${spatialRadiusKm} km ON)` : 'Spatial Query'}
+          </button>
+
+          <button
+            onClick={exportGeoJSON}
+            className="btn-3d"
+            title="Download RFC 7946 GeoJSON for QGIS / PostGIS / BigQuery GIS"
+            style={{
+              display: 'flex', alignItems: 'center', gap: '7px',
+              padding: '8px 14px', borderRadius: '10px',
+              border: '1px solid var(--line, #dbe4ec)',
+              background: 'transparent',
+              color: '#8ea3ba',
+              fontWeight: 700, fontSize: '12.5px', cursor: 'pointer',
+              fontFamily: 'var(--font-display, inherit)',
+            }}
+          >
+            <IconDownload size={14} color="#5eead4" />
+            GeoJSON
+          </button>
+
           <button
             onClick={() => setShowLayersPanel(!showLayersPanel)}
             className="btn-3d"
@@ -288,6 +423,35 @@ const MapView = ({
         </div>
       </div>
 
+      {spatialMode && (
+        <div style={{
+          background: 'rgba(236,72,153,0.1)', border: '1px solid rgba(236,72,153,0.35)',
+          color: '#f472b6', padding: '10px 16px', borderRadius: 10, marginBottom: 14,
+          fontSize: 13, fontWeight: 600, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10
+        }}>
+          <span>
+            🎯 <strong>Spatial Proximity Mode Active:</strong> Click any point on the map to query all glacial lakes within <strong>{spatialRadiusKm} km</strong>.
+          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 12 }}>Radius:</span>
+            {[15, 35, 60, 100].map((r) => (
+              <button
+                key={r}
+                onClick={() => setSpatialRadiusKm(r)}
+                style={{
+                  padding: '3px 9px', borderRadius: 6, border: '1px solid rgba(236,72,153,0.4)',
+                  background: spatialRadiusKm === r ? '#ec4899' : 'transparent',
+                  color: spatialRadiusKm === r ? '#fff' : '#f472b6',
+                  fontSize: 11.5, fontWeight: 700, cursor: 'pointer'
+                }}
+              >
+                {r} km
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {loadError && (
         <div style={{
           background: 'rgba(240,67,58,0.1)', border: '1px solid rgba(240,67,58,0.3)',
@@ -304,6 +468,122 @@ const MapView = ({
         border: '1px solid var(--line, #dbe4ec)', boxShadow: '0 10px 34px rgba(6,11,19,0.18)',
         position: 'relative'
       }}>
+
+        {/* Live WGS84 Coordinate Telemetry HUD */}
+        <div style={{
+          position: 'absolute', bottom: 14, left: 14, zIndex: 1000,
+          background: 'rgba(6,16,26,0.86)', backdropFilter: 'blur(10px)',
+          borderRadius: 10, border: '1px solid rgba(94,234,212,0.22)',
+          padding: '6px 12px', color: '#eaf4f8', fontSize: 11.5, fontFamily: 'monospace',
+          pointerEvents: 'none', display: 'flex', gap: 12, alignItems: 'center'
+        }}>
+          <span style={{ color: '#5eead4', fontWeight: 700 }}>WGS84 (EPSG:4326)</span>
+          <span>Lat: {cursorCoords.lat.toFixed(4)}° N</span>
+          <span>Lon: {cursorCoords.lon.toFixed(4)}° E</span>
+        </div>
+
+        {/* Active Flood Corridor Telemetry Overlay */}
+        {corridorData?.lake && layers.corridor && (
+          <div style={{
+            position: 'absolute', top: 16, left: 56, zIndex: 1000,
+            background: 'rgba(6,16,26,0.92)', backdropFilter: 'blur(14px)',
+            borderRadius: 14, border: '1px solid rgba(236,72,153,0.45)',
+            boxShadow: '0 10px 36px rgba(0,0,0,0.45)',
+            padding: '14px 16px', maxWidth: 340, color: '#eaf4f8'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <span style={{ fontSize: 11, fontWeight: 800, color: '#f472b6', textTransform: 'uppercase', letterSpacing: 0.7 }}>
+                🌊 GLOF Outburst Routing Trace
+              </span>
+              <button
+                onClick={() => setCorridorData(null)}
+                style={{ background: 'none', border: 'none', color: '#8ea3ba', cursor: 'pointer', fontSize: 16 }}
+              >
+                ×
+              </button>
+            </div>
+            <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 4 }}>
+              {corridorData.lake.name}
+            </div>
+            <div style={{ fontSize: 12, color: '#8ea3ba', marginBottom: 10 }}>
+              {corridorData.lake.basin_name} · {corridorData.lake.river}
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, fontSize: 12, marginBottom: 10 }}>
+              <div style={{ background: 'rgba(255,255,255,0.04)', padding: '6px 8px', borderRadius: 8 }}>
+                <div style={{ fontSize: 10, color: '#8ea3ba' }}>PEAK DISCHARGE (Qp)</div>
+                <div style={{ fontWeight: 800, color: '#f472b6' }}>{corridorData.lake.peak_discharge_m3s?.toLocaleString()} m³/s</div>
+              </div>
+              <div style={{ background: 'rgba(255,255,255,0.04)', padding: '6px 8px', borderRadius: 8 }}>
+                <div style={{ fontSize: 10, color: '#8ea3ba' }}>OUTBURST VOLUME</div>
+                <div style={{ fontWeight: 800, color: '#38bdf8' }}>{corridorData.lake.estimated_volume_million_m3} M m³</div>
+              </div>
+              <div style={{ background: 'rgba(255,255,255,0.04)', padding: '6px 8px', borderRadius: 8 }}>
+                <div style={{ fontSize: 10, color: '#8ea3ba' }}>GLACIER FEEDER</div>
+                <div style={{ fontWeight: 800, color: '#5eead4' }}>{corridorData.lake.nearest_glacier_km} km</div>
+              </div>
+              <div style={{ background: 'rgba(255,255,255,0.04)', padding: '6px 8px', borderRadius: 8 }}>
+                <div style={{ fontSize: 10, color: '#8ea3ba' }}>CORRIDOR LENGTH</div>
+                <div style={{ fontWeight: 800, color: '#f5a524' }}>{corridorData.lake.total_corridor_km} km</div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <a
+                href={`${API_BASE}/reports/sitrep/${corridorData.lake.id}`}
+                target="_blank"
+                rel="noreferrer"
+                style={{
+                  flex: 1, textAlign: 'center', padding: '6px 10px', borderRadius: 8,
+                  background: 'linear-gradient(135deg, #ec4899, #38bdf8)', color: '#fff',
+                  fontSize: 11.5, fontWeight: 800, textDecoration: 'none'
+                }}
+              >
+                📄 Download SITREP PDF
+              </a>
+            </div>
+          </div>
+        )}
+
+        {/* Spatial Proximity Query Results Overlay */}
+        {spatialResult && (
+          <div style={{
+            position: 'absolute', bottom: 48, left: 14, zIndex: 1000,
+            background: 'rgba(6,16,26,0.92)', backdropFilter: 'blur(14px)',
+            borderRadius: 14, border: '1px solid rgba(236,72,153,0.45)',
+            padding: '12px 14px', maxWidth: 320, maxHeight: 230, overflowY: 'auto', color: '#eaf4f8'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <span style={{ fontSize: 11, fontWeight: 800, color: '#f472b6', textTransform: 'uppercase' }}>
+                🎯 {spatialResult.count} Lakes Within {spatialResult.radiusKm} km
+              </span>
+              <button
+                onClick={() => setSpatialResult(null)}
+                style={{ background: 'none', border: 'none', color: '#8ea3ba', cursor: 'pointer', fontSize: 15 }}
+              >
+                ×
+              </button>
+            </div>
+            {spatialResult.results?.length === 0 ? (
+              <div style={{ fontSize: 12, color: '#8ea3ba' }}>No monitored lakes inside this radius.</div>
+            ) : (
+              spatialResult.results?.slice(0, 8).map((item) => (
+                <div
+                  key={item.id}
+                  onClick={() => traceFloodCorridor(item.id)}
+                  style={{
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    padding: '5px 6px', borderBottom: '1px solid rgba(255,255,255,0.07)',
+                    fontSize: 12, cursor: 'pointer'
+                  }}
+                >
+                  <span style={{ fontWeight: 700 }}>{item.name}</span>
+                  <span style={{ color: '#5eead4', fontFamily: 'monospace', fontSize: 11 }}>
+                    {item.distance_km} km ({item.bearing_deg}°)
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
+        )}
 
         {/* Layers Panel */}
         {showLayersPanel && (
@@ -329,6 +609,9 @@ const MapView = ({
               { key: 'lakes', label: 'GLOF Lakes', color: '#38bdf8', icon: '💧' },
               { key: 'provincial', label: 'Provincial Boundary', color: '#38bdf8', icon: '🗺️' },
               { key: 'districts', label: 'GLOF Districts', color: '#5eead4', icon: '📍' },
+              ...(corridorData ? [
+                { key: 'corridor', label: 'Flood Routing Trace', color: '#ec4899', icon: '🌊' },
+              ] : []),
               ...(showZones ? [
                 { key: 'danger', label: 'Danger Zone', color: '#f0433a', icon: '🔴' },
                 { key: 'warning', label: 'Warning Zone', color: '#f5a524', icon: '🟠' },
@@ -362,6 +645,12 @@ const MapView = ({
         )}
 
         <MapContainer center={[36.2, 74.5]} zoom={7} style={{ height: '100%', width: '100%' }}>
+          <MapInteractionEvents
+            onCursorMove={setCursorCoords}
+            spatialMode={spatialMode}
+            onSpatialClick={runSpatialSearch}
+          />
+
           <TileLayer
             key={activeLayer}
             attribution={MAP_LAYERS[activeLayer].attribution}
@@ -381,10 +670,73 @@ const MapView = ({
             />
           )}
 
+          {/* Spatial Query Search Circle */}
+          {spatialResult?.center && (
+            <Circle
+              center={[spatialResult.center.lat, spatialResult.center.lon]}
+              radius={spatialResult.radiusKm * 1000}
+              pathOptions={{
+                color: '#ec4899',
+                fillColor: '#ec4899',
+                fillOpacity: 0.1,
+                weight: 2,
+                dashArray: '6 4',
+              }}
+            />
+          )}
+
+          {/* Active Flood Routing Corridor & Glacier Feeder LineStrings */}
+          {corridorData && layers.corridor && glacierLine && (
+            <Polyline
+              positions={glacierLine.geometry.coordinates.map(([lon, lat]) => [lat, lon])}
+              pathOptions={{ color: '#38bdf8', weight: 3, dashArray: '5 5' }}
+            />
+          )}
+
+          {corridorData && layers.corridor && downstreamLine && (
+            <Polyline
+              positions={downstreamLine.geometry.coordinates.map(([lon, lat]) => [lat, lon])}
+              pathOptions={{ color: '#ec4899', weight: 4, opacity: 0.95 }}
+            />
+          )}
+
+          {corridorData && layers.corridor && storageNodes.map((node, idx) => {
+            const [lon, lat] = node.geometry.coordinates;
+            const props = node.properties || {};
+            return (
+              <CircleMarker
+                key={`storage-node-${idx}`}
+                center={[lat, lon]}
+                radius={7}
+                pathOptions={{
+                  color: '#ffffff',
+                  fillColor: '#ec4899',
+                  fillOpacity: 1,
+                  weight: 2,
+                }}
+              >
+                <Popup>
+                  <div style={{ minWidth: 190 }}>
+                    <div style={{ fontSize: 11, fontWeight: 800, color: '#ec4899', textTransform: 'uppercase' }}>
+                      Downstream Node #{props.sequence} ({props.node_type})
+                    </div>
+                    <div style={{ fontSize: 14, fontWeight: 800, color: '#0c1826', margin: '4px 0' }}>
+                      {props.name}
+                    </div>
+                    <div style={{ fontSize: 12, color: '#334155' }}>
+                      Distance from Lake: <strong>{props.distance_from_lake_km} km</strong><br />
+                      Est. Wave Arrival: <strong>~{props.estimated_arrival_min} min</strong>
+                    </div>
+                  </div>
+                </Popup>
+              </CircleMarker>
+            );
+          })}
+
           {/* WARNING ZONES (draw first so danger appears on top) */}
           {showZones && layers.warning && filteredLakes.map((lake) => {
             if (!lake.latitude || !lake.longitude) return null;
-            const risk = getRisk(lake.area_ha);
+            const risk = getRisk(lake.area_ha, lake.risk_level);
             const { warning } = getZoneRadii(risk);
             return (
               <Circle
@@ -405,7 +757,7 @@ const MapView = ({
           {/* DANGER ZONES */}
           {showZones && layers.danger && filteredLakes.map((lake) => {
             if (!lake.latitude || !lake.longitude) return null;
-            const risk = getRisk(lake.area_ha);
+            const risk = getRisk(lake.area_ha, lake.risk_level);
             const { danger } = getZoneRadii(risk);
             return (
               <Circle
@@ -426,7 +778,7 @@ const MapView = ({
           {layers.lakes && filteredLakes.map((lake) => {
             if (!lake.latitude || !lake.longitude) return null;
 
-            const risk = getRisk(lake.area_ha);
+            const risk = getRisk(lake.area_ha, lake.risk_level);
             const riskColor =
               risk === 'High' ? '#f0433a' :
               risk === 'Medium' ? '#f5a524' : '#2dd48e';
@@ -457,7 +809,7 @@ const MapView = ({
 
                     <div style={{
                       display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px',
-                      marginBottom: '14px', background: '#f6f9fb', padding: '10px',
+                      marginBottom: '12px', background: '#f6f9fb', padding: '10px',
                       borderRadius: '10px', border: '1px solid #dde5ec'
                     }}>
                       <div>
@@ -472,17 +824,31 @@ const MapView = ({
                       </div>
                     </div>
 
-                    <button
-                      onClick={() => setSelectedLake(lake)}
-                      className="btn-3d"
-                      style={{
-                        width: '100%', padding: '8px 0', borderRadius: '8px', border: 'none',
-                        background: 'linear-gradient(135deg, #5eead4, #38bdf8)',
-                        color: '#06131a', fontSize: '12.5px', fontWeight: 800, cursor: 'pointer'
-                      }}
-                    >
-                      View Risk Assessment →
-                    </button>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '7px' }}>
+                      <button
+                        onClick={() => setSelectedLake(lake)}
+                        className="btn-3d"
+                        style={{
+                          width: '100%', padding: '8px 0', borderRadius: '8px', border: 'none',
+                          background: 'linear-gradient(135deg, #5eead4, #38bdf8)',
+                          color: '#06131a', fontSize: '12.5px', fontWeight: 800, cursor: 'pointer'
+                        }}
+                      >
+                        View Risk Assessment →
+                      </button>
+                      <button
+                        onClick={() => traceFloodCorridor(lake.id)}
+                        className="btn-3d"
+                        style={{
+                          width: '100%', padding: '7px 0', borderRadius: '8px',
+                          border: '1px solid rgba(236,72,153,0.4)',
+                          background: 'rgba(236,72,153,0.1)',
+                          color: '#be185d', fontSize: '12px', fontWeight: 800, cursor: 'pointer'
+                        }}
+                      >
+                        {corridorLoadingId === lake.id ? 'Tracing Corridor...' : '🌊 Trace Flood Corridor'}
+                      </button>
+                    </div>
                   </div>
                 </Popup>
               </Marker>

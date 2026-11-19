@@ -1,19 +1,22 @@
-from pydantic import BaseModel
 from typing import Optional
+from pydantic import BaseModel, ConfigDict
+
 
 class LakeBase(BaseModel):
     name: str
     area_ha: float
-    risk_level: Optional[str] = None          # ← now optional
+    risk_level: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+
 
 class LakeCreate(LakeBase):
     pass
 
+
 class Lake(LakeBase):
     id: int
-    risk_level: str                           # always present when reading
+    risk_level: str
+    geom: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
