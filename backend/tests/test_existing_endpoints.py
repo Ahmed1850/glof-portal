@@ -63,6 +63,7 @@ class TestExistingEndpoints(unittest.TestCase):
         backend_dir = str(Path(__file__).resolve().parents[1])
         code = "\n".join([
             "import os, sys",
+            "from concurrent.futures import ThreadPoolExecutor",
             "from unittest.mock import patch",
             "os.environ['DATABASE_URL'] = 'sqlite:///:memory:'",
             "os.environ['SEED_ON_START'] = '1'",
@@ -76,16 +77,32 @@ class TestExistingEndpoints(unittest.TestCase):
             "    p = None",
             "import app.main as m",
             "if p is not None: p.stop()",
+            "from app.api.routers import lakes as lr, analytics as ar",
+            "for mod in (m, lr, ar):",
+            "    if hasattr(mod, 'limiter'): mod.limiter.enabled = False",
             "from fastapi.testclient import TestClient",
             "r = TestClient(m.app).get('/lakes/')",
             "assert r.status_code == 200 and len(r.json()) == 46, (r.status_code, len(r.json()))",
+            "paths = ['/lakes/', '/analytics/providers', '/analytics/districts', '/analytics/basins/cascade'] * 6",
+            "shared = TestClient(m.app)",
+            "def _hit_shared(path):",
+            "    resp = shared.get(path)",
+            "    assert resp.status_code == 200, (path, resp.status_code, resp.text)",
+            "    if path == '/lakes/': assert len(resp.json()) == 46",
+            "def _hit_separate(path):",
+            "    resp = TestClient(m.app).get(path)",
+            "    assert resp.status_code == 200, (path, resp.status_code, resp.text)",
+            "    if path == '/lakes/': assert len(resp.json()) == 46",
+            "with ThreadPoolExecutor(max_workers=8) as ex:",
+            "    list(ex.map(_hit_shared, paths))",
+            "    list(ex.map(_hit_separate, paths))",
             "m.engine.dispose()",
         ])
         proc = subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=90,
         )
         self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr}\nstdout={proc.stdout}")
 
@@ -229,9 +246,20 @@ class TestExistingEndpoints(unittest.TestCase):
                 self.assertEqual(r_score.status_code, 200)
                 self.assertIn("early_warning", r_score.json())
 
-                r_mon = self.client.get("/early-warning/monitor?use_gee=false&limit=5")
-                self.assertEqual(r_mon.status_code, 200)
-                self.assertEqual(r_mon.json()["total"], 5)
+                reset_analytics_caches()
+                elev_calls = {"n": 0}
+                base_mock = make_mock_httpx_get()
+
+                def _counting_elev_mock(url, params=None, headers=None, timeout=None, **kwargs):
+                    if "api.open-meteo.com/v1/elevation" in url:
+                        elev_calls["n"] += 1
+                    return base_mock(url, params=params, headers=headers, timeout=timeout, **kwargs)
+
+                with patch("httpx.get", side_effect=_counting_elev_mock):
+                    r_mon = self.client.get("/early-warning/monitor?use_gee=false&limit=46")
+                    self.assertEqual(r_mon.status_code, 200)
+                    self.assertEqual(r_mon.json()["total"], 46)
+                    self.assertLessEqual(elev_calls["n"], 1)
 
                 r_job = self.client.post("/early-warning/monitor/jobs?use_gee=false&limit=3")
                 self.assertEqual(r_job.status_code, 200)

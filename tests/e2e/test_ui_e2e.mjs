@@ -32,6 +32,8 @@ async function openLanding() {
   await browser.goto(uiUrl);
   await browser.waitForSelector('h1');
   await browser.waitForText('Every glacial lake, watched before it breaks the valley\\.');
+  // Allow Framer Motion entrance stagger/fadeUp animations to settle before clicking hero CTAs
+  await new Promise((r) => setTimeout(r, 700));
 }
 
 async function enterPortal() {
@@ -39,6 +41,7 @@ async function enterPortal() {
   await browser.clickByText('button', 'Enter Portal');
   await browser.waitForText('Total Lakes:\\s*[4-9]\\d');
   await browser.waitForSelector('.leaflet-container');
+  await new Promise((r) => setTimeout(r, 350));
 }
 
 async function navigateTab(sidebarLabelRegex, expectedH2Regex) {
@@ -304,21 +307,26 @@ describe('Tier 1 — UI & GIS Core Happy Paths', { skip: !tierEnabled(1) }, () =
 
     // 3. Live WGS84 cursor telemetry updates on mousemove over .leaflet-container
     const mapRect = await browser.evaluate(() => {
-      const r = document.querySelector('.leaflet-container').getBoundingClientRect();
+      const container = document.querySelector('.leaflet-container');
+      container.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      const r = container.getBoundingClientRect();
       return { left: r.left, top: r.top, width: r.width, height: r.height };
     });
     const readCoords = () =>
       browser.evaluate(() => {
-        const el = Array.from(document.querySelectorAll('*')).find(
+        const el = Array.from(document.querySelectorAll('div, span')).find(
           (n) =>
             n.children.length <= 4 &&
-            (n.innerText || '').includes('WGS84 (EPSG:4326)'),
+            (n.innerText || '').includes('WGS84 (EPSG:4326)') &&
+            (n.innerText || '').length < 120,
         );
         return el ? el.innerText : '';
       });
-    await browser.moveMouse(mapRect.left + mapRect.width * 0.35, mapRect.top + mapRect.height * 0.35);
+    await browser.moveMouse(mapRect.left + mapRect.width * 0.30, mapRect.top + mapRect.height * 0.55);
+    await new Promise((r) => setTimeout(r, 80));
     const coords1 = await readCoords();
-    await browser.moveMouse(mapRect.left + mapRect.width * 0.62, mapRect.top + mapRect.height * 0.62);
+    await browser.moveMouse(mapRect.left + mapRect.width * 0.52, mapRect.top + mapRect.height * 0.72);
+    await new Promise((r) => setTimeout(r, 80));
     const coords2 = await readCoords();
     assert.match(coords1, /Lat:\s*\d+\.\d+/);
     assert.match(coords2, /Lon:\s*\d+\.\d+/);
@@ -393,16 +401,16 @@ describe('Tier 1 — UI & GIS Core Happy Paths', { skip: !tierEnabled(1) }, () =
   it('T1.6 GeoJSON & Tabular CSV/PDF export triggers', async () => {
     await enterPortal();
     browser.clearTelemetry();
-    await browser.clickByText('button', '^GeoJSON$');
-    await browser.waitFor(
-      () => true,
-      [],
-      { timeoutMs: 500 },
-    );
-    await new Promise((r) => setTimeout(r, 600));
-    const geojsonCall = browser.apiResponses.find(
-      (r) => r.url.includes('/lakes/geojson') || r.url.includes('/reports/export/geojson'),
-    );
+    await browser.clickByText('button', 'GeoJSON');
+    const deadline = Date.now() + 8000;
+    let geojsonCall = null;
+    while (Date.now() < deadline) {
+      geojsonCall = browser.apiResponses.find(
+        (r) => r.url.includes('/lakes/geojson') || r.url.includes('/reports/export/geojson'),
+      );
+      if (geojsonCall) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
     assert.ok(geojsonCall, 'Expected GeoJSON export API request');
     assert.equal(geojsonCall.status, 200);
 
@@ -422,7 +430,7 @@ describe('Tier 1 — UI & GIS Core Happy Paths', { skip: !tierEnabled(1) }, () =
       // F12: Scale bar & Quick-Jump & Zone toggles & Choropleth
       await browser.waitForSelector('.leaflet-control-scale-line');
       const layersOpen = await browser.evaluate(() =>
-        document.body.innerText.includes('Map Layers'),
+        /map layers/i.test(document.body.innerText || ''),
       );
       if (!layersOpen) {
         await browser.clickByText('button', 'Layers');
@@ -573,9 +581,10 @@ describe('Tier 2 — Validation, Mobile Viewport & Offline Resilience', { skip: 
     await navigateTab('^Lakes Inventory$', '^Lakes Inventory$');
     await browser.clickByText('table button', '^Rename$');
     await browser.waitForText('Rename Lake');
+    await new Promise((r) => setTimeout(r, 450));
 
     if (!IS_BASELINE) {
-      await browser.typeInto('.hud-frame input[type="text"], [role="dialog"] input[type="text"]', '');
+      await browser.typeInto('input.input-3d[type="text"], [role="dialog"] input[type="text"]', '');
       await browser.clickByText('button', '^Save Name$');
       await browser.waitForSelector('[role="status"], [role="alert"], [aria-live]');
     }
@@ -655,12 +664,19 @@ describe('Tier 3 — Cross-Feature UI Workflows', { skip: !tierEnabled(3) || IS_
     await browser.clickByText('button', 'Breach Sim|Simulate Breach');
     await browser.waitForSelector('.recharts-wrapper');
     await browser.clickByText('button', '^Ice$');
-    await browser.waitFor(
-      () =>
-        browser.apiResponses.some((r) => r.url.includes('/analytics/breach-simulation/') && r.url.includes('dam_type=ice') && r.status === 200),
-      [],
-      { timeoutMs: 8000, label: 'breach-simulation API call with dam_type=ice' },
-    );
+    const iceDeadline = Date.now() + 8000;
+    let hasIceCall = false;
+    while (Date.now() < iceDeadline) {
+      hasIceCall = browser.apiResponses.some(
+        (r) =>
+          r.url.includes('/analytics/breach-simulation/') &&
+          r.url.includes('dam_type=ice') &&
+          r.status === 200,
+      );
+      if (hasIceCall) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    assert.ok(hasIceCall, 'Expected breach-simulation API call with dam_type=ice');
     assertCleanBrowserHealth();
   });
 
@@ -691,7 +707,7 @@ describe('Tier 3 — Cross-Feature UI Workflows', { skip: !tierEnabled(3) || IS_
     await browser.waitForText('View GLOF Basin', { timeoutMs: 25000 });
     await browser.clickByText('button', 'View GLOF Basin');
     await browser.waitForText('GLOF Basins');
-    await browser.waitForText('Domino|Cascade');
+    await browser.waitForText('Domino|Cascade Tier');
     assertCleanBrowserHealth();
   });
 
@@ -770,7 +786,7 @@ describe('Tier 4 — Stakeholder UI Journeys', { skip: !tierEnabled(4) || IS_BAS
     const baselineCountText = await browser.evaluate(
       () =>
         Array.from(document.querySelectorAll('.mono-label')).find((e) =>
-          e.innerText.includes('Total Lakes:'),
+          /total lakes:/i.test(e.innerText || ''),
         )?.innerText || '',
     );
     const baselineCount = Number(baselineCountText.match(/(\d+)/)?.[1] || 0);
@@ -804,7 +820,7 @@ describe('Tier 4 — Stakeholder UI Journeys', { skip: !tierEnabled(4) || IS_BAS
       (expected) => {
         const txt =
           Array.from(document.querySelectorAll('.mono-label')).find((e) =>
-            e.innerText.includes('Total Lakes:'),
+            /total lakes:/i.test(e.innerText || ''),
           )?.innerText || '';
         const n = Number(txt.match(/(\d+)/)?.[1] || 0);
         return n === expected;
@@ -838,7 +854,7 @@ describe('Tier 4 — Stakeholder UI Journeys', { skip: !tierEnabled(4) || IS_BAS
       (expected) => {
         const txt =
           Array.from(document.querySelectorAll('.mono-label')).find((e) =>
-            e.innerText.includes('Total Lakes:'),
+            /total lakes:/i.test(e.innerText || ''),
           )?.innerText || '';
         const n = Number(txt.match(/(\d+)/)?.[1] || 0);
         return n === expected;

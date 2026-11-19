@@ -154,7 +154,38 @@ const FEATURES = [
   },
 ];
 
-export default function LandingPage({ onLaunch }) {
+const SHOWCASE_CAPABILITIES = [
+  {
+    icon: IconPulseDot,
+    title: 'Dam-Breach Simulator',
+    badge: 'FROEHLICH · COSTA',
+    desc: '0–240 min kinematic flood-wave player, outburst hydrograph Q(t), stage rise & downstream node ETAs',
+  },
+  {
+    icon: IconSatellite,
+    title: 'Multi-Hazard Triggers',
+    badge: 'THERMAL · GLOFAS · USGS',
+    desc: '14-day melt & freezing-level stress, GloFAS river discharge anomalies & USGS M≥3.5 seismicity',
+  },
+  {
+    icon: IconGlobe,
+    title: 'District Choropleth & GIS',
+    badge: 'RAY-CAST · WKT',
+    desc: 'Point-in-polygon district hazard density, spatial proximity query & RFC 7946 GeoJSON/CSV exports',
+  },
+  {
+    icon: IconShield,
+    title: 'Sensitivity & Comparison',
+    badge: 'MONTE CARLO · SSP',
+    desc: 'N=500 uncertainty (P10/P50/P90), +1.5/+3.0°C SSP scenarios, multi-lake radar & domino cascade',
+  },
+];
+
+export default function LandingPage({ onLaunch, onEnter, stats, telemetry }) {
+  const handleEnter = onLaunch || onEnter || (() => {});
+  const resolvedStats = stats || telemetry || {};
+  const edgePad = 'clamp(16px, 4vw, 56px)';
+
   return (
     <motion.div
       initial={{ opacity: 0 }}
@@ -202,7 +233,7 @@ export default function LandingPage({ onLaunch }) {
         className="mono-label"
         style={{
           position: 'relative', zIndex: 10, display: 'flex', alignItems: 'center', gap: 10,
-          padding: '9px 56px', fontSize: 10.5, color: '#5b7690',
+          padding: `9px ${edgePad}`, fontSize: 10.5, color: '#5b7690',
           borderBottom: '1px solid var(--line, rgba(103,232,249,0.12))',
           background: 'rgba(6,11,19,0.6)',
           flexWrap: 'wrap',
@@ -221,7 +252,7 @@ export default function LandingPage({ onLaunch }) {
         <span style={{ opacity: 0.4 }}>·</span>
         <span>S2 · S1-SAR · MPC · WORLDPOP</span>
         <span style={{ opacity: 0.4 }}>·</span>
-        <span>GEE CASCADE</span>
+        <span>BREACH SIM · GLOFAS · USGS</span>
         <span style={{ opacity: 0.4 }}>·</span>
         <span>GILGIT-BALTISTAN</span>
       </motion.div>
@@ -233,7 +264,7 @@ export default function LandingPage({ onLaunch }) {
         transition={{ duration: 0.5, delay: 0.08, ease: easeOut }}
         style={{
           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-          padding: '20px 56px', position: 'relative', zIndex: 10,
+          padding: `20px ${edgePad}`, position: 'relative', zIndex: 10, gap: 12, flexWrap: 'wrap',
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
@@ -257,7 +288,8 @@ export default function LandingPage({ onLaunch }) {
         </div>
 
         <motion.button
-          onClick={onLaunch}
+          type="button"
+          onClick={handleEnter}
           className="btn-3d"
           whileHover={{ scale: 1.04, borderColor: 'rgba(94,234,212,0.45)' }}
           whileTap={{ scale: 0.97 }}
@@ -275,7 +307,7 @@ export default function LandingPage({ onLaunch }) {
       {/* Hero */}
       <main style={{
         flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center',
-        padding: '20px 56px 48px', maxWidth: 1180, margin: '0 auto', width: '100%',
+        padding: `20px ${edgePad} 48px`, maxWidth: 1180, margin: '0 auto', width: '100%',
         position: 'relative', zIndex: 10,
       }}>
         <motion.div
@@ -316,12 +348,12 @@ export default function LandingPage({ onLaunch }) {
           <motion.p
             variants={fadeUp}
             style={{
-              fontSize: 16.5, color: '#8ea3ba', maxWidth: 620, lineHeight: 1.7, marginBottom: 36,
+              fontSize: 16.5, color: '#8ea3ba', maxWidth: 660, lineHeight: 1.7, marginBottom: 36,
             }}
           >
-            Operational GLOF intelligence for Northern Pakistan — multi-source satellite cascade
-            (optical + all-weather SAR), flood early warning, basin routing, hybrid lake history,
-            population exposure, and field registration in one command surface.
+            Operational GLOF intelligence for Northern Pakistan — multi-source optical + SAR satellite
+            cascade, hydraulic dam-breach simulation, multi-hazard hydrometeorological &amp; seismic
+            triggers, district risk choropleth, and Monte Carlo SSP sensitivity in one command surface.
           </motion.p>
 
           <motion.div
@@ -329,7 +361,8 @@ export default function LandingPage({ onLaunch }) {
             style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 48, flexWrap: 'wrap' }}
           >
             <motion.button
-              onClick={onLaunch}
+              type="button"
+              onClick={handleEnter}
               className="btn-3d"
               whileHover={{
                 scale: 1.04,
@@ -351,7 +384,7 @@ export default function LandingPage({ onLaunch }) {
                 GEE · Sentinel-2 · Sentinel-1 SAR · Planetary Computer
               </div>
               <div style={{ fontSize: 11.5, color: '#5b7690', paddingLeft: 25, opacity: 0.85 }}>
-                Cascade fallbacks · WorldPop · Flood board · Basins
+                Breach physics · GloFAS · USGS seismic · WorldPop · Flood board
               </div>
             </div>
           </motion.div>
@@ -401,9 +434,9 @@ export default function LandingPage({ onLaunch }) {
             variants={staggerContainer}
             style={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
               gap: 12,
-              marginBottom: 36,
+              marginBottom: 24,
               maxWidth: 960,
             }}
           >
@@ -418,6 +451,34 @@ export default function LandingPage({ onLaunch }) {
             ))}
           </motion.div>
 
+          {/* Digital Twin & Hazard Intelligence Showcase */}
+          <motion.div variants={fadeUp} style={{ maxWidth: 960, marginBottom: 36 }}>
+            <div
+              className="mono-label"
+              style={{ fontSize: 10.5, color: '#38bdf8', marginBottom: 10, fontWeight: 700 }}
+            >
+              DIGITAL TWIN &amp; HAZARD INTELLIGENCE
+            </div>
+            <motion.div
+              variants={staggerContainer}
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+                gap: 12,
+              }}
+            >
+              {SHOWCASE_CAPABILITIES.map((cap) => (
+                <FeatureCard
+                  key={cap.title}
+                  icon={cap.icon}
+                  title={cap.title}
+                  desc={cap.desc}
+                  badge={cap.badge}
+                />
+              ))}
+            </motion.div>
+          </motion.div>
+
           {/* Telemetry panel */}
           <motion.div
             variants={fadeUp}
@@ -429,12 +490,12 @@ export default function LandingPage({ onLaunch }) {
               border: '1px solid var(--line, rgba(103,232,249,0.14))', borderRadius: 16, maxWidth: 960,
             }}
           >
-            <StatTile value="4×" label="Sensor Cascade" sub="GEE · MPC · SAR · DB" accent="#5eead4" />
-            <StatTile value="S1" label="All-Weather SAR" sub="Cloud-penetrating VV" accent="#fbbf24" />
-            <StatTile value="11yr" label="Hybrid History" sub="S2 NDWI + SAR series" accent="#38bdf8" />
-            <StatTile value="EW" label="Flood Board" sub="Growth · pop · basins" accent="#5eead4" />
-            <StatTile value="5–15" label="Pop. Limits" sub="High-risk first scan" accent="#f0433a" />
-            <StatTile value="GB" label="Coverage" sub="Gilgit-Baltistan focus" accent="#38bdf8" />
+            <StatTile value={resolvedStats.cascade || '4×'} label="Sensor Cascade" sub="GEE · MPC · SAR · DB" accent="#5eead4" />
+            <StatTile value={resolvedStats.sar || 'S1'} label="All-Weather SAR" sub="Cloud-penetrating VV" accent="#fbbf24" />
+            <StatTile value={resolvedStats.history || '11yr'} label="Hybrid History" sub="S2 NDWI + SAR series" accent="#38bdf8" />
+            <StatTile value={resolvedStats.ew || 'EW'} label="Flood Board" sub="Growth · pop · basins" accent="#5eead4" />
+            <StatTile value={resolvedStats.popLimits || '5–15'} label="Pop. Limits" sub="High-risk first scan" accent="#f0433a" />
+            <StatTile value={resolvedStats.coverage || 'GB'} label="Coverage" sub="Gilgit-Baltistan focus" accent="#38bdf8" />
           </motion.div>
         </motion.div>
       </main>
@@ -445,7 +506,7 @@ export default function LandingPage({ onLaunch }) {
         animate={{ opacity: 1 }}
         transition={{ delay: 0.6, duration: 0.5 }}
         style={{
-          padding: '16px 56px', borderTop: '1px solid var(--line, rgba(103,232,249,0.12))',
+          padding: `16px ${edgePad}`, borderTop: '1px solid var(--line, rgba(103,232,249,0.12))',
           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
           fontSize: 12.5, color: '#5b7690', position: 'relative', zIndex: 10, flexWrap: 'wrap', gap: 10,
         }}

@@ -113,8 +113,11 @@ class TestExportsAndSpa(unittest.TestCase):
             static_dir = tmp_path / "static"
             static_dir.mkdir()
             (static_dir / "index.html").write_text("<html><body>GLOF SPA</body></html>", encoding="utf-8")
+            assets_dir = static_dir / "assets"
+            assets_dir.mkdir()
+            (assets_dir / "app.js").write_text("console.log('glof');", encoding="utf-8")
 
-            # Verify spa_fallback logic when STATIC_DIR points to a built static directory
+            # Verify real app.main spa_fallback route when GLOF_STATIC_DIR points to a built static directory
             script = "\n".join([
                 "import os, sys",
                 "from pathlib import Path",
@@ -122,6 +125,7 @@ class TestExportsAndSpa(unittest.TestCase):
                 f"os.environ['DATABASE_URL'] = 'sqlite:///' + {db_file.as_posix()!r}",
                 "os.environ['SEED_ON_START'] = '1'",
                 "os.environ['WARM_WEATHER_ON_START'] = '0'",
+                f"os.environ['GLOF_STATIC_DIR'] = {str(static_dir)!r}",
                 f"sys.path.insert(0, {str(backend_dir)!r})",
                 "try:",
                 "    import ee",
@@ -131,26 +135,16 @@ class TestExportsAndSpa(unittest.TestCase):
                 "    p = None",
                 "import app.main as m",
                 "if p is not None: p.stop()",
-                f"m.STATIC_DIR = Path({str(static_dir)!r})",
-                "from fastapi.responses import FileResponse, JSONResponse",
                 "from fastapi.testclient import TestClient",
-                "src = Path(m.__file__).read_text(encoding='utf-8')",
-                "assert '\"analytics\"' in src and '\"reports\"' in src, 'analytics missing from spa_fallback tuple'",
-                "if not any(getattr(r, 'name', None) == 'spa_fallback' for r in m.app.routes):",
-                "    @m.app.get('/{full_path:path}')",
-                "    def spa_fallback(full_path: str):",
-                "        if full_path.startswith(('lakes', 'gee', 'risk', 'reports', 'analytics', 'auth', 'early-warning', 'docs', 'openapi', 'redoc', 'health', 'api', 'assets', 'weather')):",
-                "            return JSONResponse({'detail': 'Not found'}, status_code=404)",
-                "        candidate = m.STATIC_DIR / full_path",
-                "        if candidate.is_file():",
-                "            return FileResponse(candidate)",
-                "        return FileResponse(m.STATIC_DIR / 'index.html')",
+                "assert any(getattr(r, 'name', None) == 'spa_fallback' for r in m.app.routes), 'real spa_fallback not registered'",
                 "c = TestClient(m.app)",
                 "assert c.get('/analytics/providers').status_code == 200",
                 "r_an = c.get('/analytics/nonexistent')",
                 "assert r_an.status_code == 404 and r_an.json() == {'detail': 'Not found'}, r_an.text",
                 "r_rp = c.get('/reports/nonexistent')",
                 "assert r_rp.status_code == 404 and r_rp.json() == {'detail': 'Not found'}, r_rp.text",
+                "r_asset = c.get('/assets/app.js')",
+                "assert r_asset.status_code == 200 and 'glof' in r_asset.text, r_asset.text",
                 "r_spa = c.get('/dashboard')",
                 "assert r_spa.status_code == 200 and 'GLOF SPA' in r_spa.text, r_spa.text",
                 "m.engine.dispose()",
@@ -159,7 +153,7 @@ class TestExportsAndSpa(unittest.TestCase):
                 [sys.executable, "-c", script],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=90,
             )
             self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr}\nstdout={proc.stdout}")
 

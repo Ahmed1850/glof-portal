@@ -11,7 +11,10 @@ Tests for Milestone M1 Analytics Showcase endpoints:
 
 from __future__ import annotations
 
+import json
+import math
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -252,6 +255,217 @@ class TestAnalyticsShowcase(unittest.TestCase):
         self.assertGreaterEqual(s["scenarios"][2]["p50_score"], s["scenarios"][0]["p50_score"])
 
         self.assertEqual(self.client.get("/analytics/sensitivity/99999").status_code, 404)
+
+    def test_09_regional_triggers_single_elevation_call_and_provenance(self):
+        from app.services import trigger_engine
+
+        elev_calls = {"n": 0}
+        usgs_radii: list[int] = []
+        base_mock = make_mock_httpx_get()
+
+        def _counting_mock(url, params=None, headers=None, timeout=None, **kwargs):
+            if "api.open-meteo.com/v1/elevation" in url:
+                elev_calls["n"] += 1
+            if "earthquake.usgs.gov/fdsnws/event/1/query" in url and params:
+                usgs_radii.append(int(params.get("maxradiuskm", 0)))
+            return base_mock(url, params=params, headers=headers, timeout=timeout, **kwargs)
+
+        with patch("httpx.get", side_effect=_counting_mock):
+            r = self.client.get("/analytics/triggers/regional")
+        self.assertEqual(r.status_code, 200)
+        self.assertLessEqual(elev_calls["n"], 1)
+        self.assertEqual(elev_calls["n"], 1)
+        self.assertIn(420, usgs_radii)
+        self.assertFalse(r.json()["provenance"]["fallback_used"])
+
+        # Mixed forecast failure + success should report mixed (offline_fallback)
+        reset_analytics_caches()
+        forecast_seen = {"n": 0}
+
+        def _mixed_mock(url, params=None, headers=None, timeout=None, **kwargs):
+            if "api.open-meteo.com/v1/forecast" in url:
+                forecast_seen["n"] += 1
+                if forecast_seen["n"] == 1:
+                    raise httpx.ConnectTimeout("partial forecast timeout")
+            return base_mock(url, params=params, headers=headers, timeout=timeout, **kwargs)
+
+        with patch("httpx.get", side_effect=_mixed_mock):
+            r_mix = self.client.get("/analytics/triggers/regional")
+        self.assertEqual(r_mix.status_code, 200)
+        prov = r_mix.json()["provenance"]
+        self.assertTrue(prov["fallback_used"])
+        self.assertEqual(prov["open_meteo"], "mixed (offline_fallback)")
+
+        # Elevation-only failure on single-lake trigger must set fallback_used=True
+        reset_analytics_caches()
+
+        def _elev_only_fail(url, params=None, headers=None, timeout=None, **kwargs):
+            if "api.open-meteo.com/v1/elevation" in url:
+                raise httpx.ConnectTimeout("elev timeout")
+            return base_mock(url, params=params, headers=headers, timeout=timeout, **kwargs)
+
+        with patch("httpx.get", side_effect=_elev_only_fail):
+            r_el = self.client.get("/analytics/triggers/1")
+        self.assertEqual(r_el.status_code, 200)
+        self.assertTrue(r_el.json()["provenance"]["fallback_used"])
+        self.assertEqual(r_el.json()["lake_elevation_m"], 3850.0)
+        self.assertEqual(len(trigger_engine._FORECAST_CACHE), 1)
+
+    def test_10_malformed_and_nan_http200_payloads_resilience_and_no_poisoning(self):
+        from app.services import elevation_service, trigger_engine
+
+        bad_scenarios = [
+            # 1. Partial 2-day schema (USGS is valid empty collection)
+            (
+                {"daily": {"time": ["2026-11-19", "2026-11-20"]}},
+                {"daily": {"time": ["2026-11-19", "2026-11-20"]}},
+                {"type": "FeatureCollection", "features": []},
+                {"elevation": [2366.0]},
+                1,
+                1,
+            ),
+            # 2. Non-numeric string values in arrays / coordinates
+            (
+                {
+                    "daily": {
+                        "time": [f"2026-11-{i+1:02d}" for i in range(14)],
+                        "temperature_2m_max": ["bad"] * 14,
+                        "temperature_2m_min": [2.0] * 14,
+                        "precipitation_sum": [0.5] * 14,
+                    }
+                },
+                {
+                    "daily": {
+                        "time": [f"2026-11-{i+1:02d}" for i in range(14)],
+                        "river_discharge": ["bad"] * 14,
+                    }
+                },
+                {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "properties": {"mag": 4.2},
+                            "geometry": {"type": "Point", "coordinates": ["bad", 36.2]},
+                        }
+                    ],
+                },
+                {"elevation": ["bad"]},
+                0,
+                0,
+            ),
+            # 3. Non-finite "NaN" strings
+            (
+                {
+                    "daily": {
+                        "time": [f"2026-11-{i+1:02d}" for i in range(14)],
+                        "temperature_2m_max": ["NaN"] * 14,
+                        "temperature_2m_min": [2.0] * 14,
+                        "precipitation_sum": [0.5] * 14,
+                    }
+                },
+                {
+                    "daily": {
+                        "time": [f"2026-11-{i+1:02d}" for i in range(14)],
+                        "river_discharge": ["NaN"] * 14,
+                    }
+                },
+                {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "properties": {"mag": "NaN"},
+                            "geometry": {"type": "Point", "coordinates": [74.5, 36.2]},
+                        }
+                    ],
+                },
+                {"elevation": ["NaN"]},
+                0,
+                0,
+            ),
+            # 4. Wrong container types
+            (
+                {"daily": {"time": "not-a-list"}},
+                {"daily": {"time": "not-a-list"}},
+                {"type": "FeatureCollection", "features": ["not-a-dict"]},
+                {"elevation": ["Inf"]},
+                0,
+                0,
+            ),
+        ]
+
+        for f_json, g_json, u_json, e_json, exp_usgs, exp_elev in bad_scenarios:
+            reset_analytics_caches()
+
+            def _malformed_get(url, params=None, headers=None, timeout=None, _f=f_json, _g=g_json, _u=u_json, _e=e_json, **kwargs):
+                req = httpx.Request("GET", url, params=params)
+                if "api.open-meteo.com/v1/elevation" in url:
+                    return httpx.Response(200, json=_e, request=req)
+                if "api.open-meteo.com/v1/forecast" in url:
+                    return httpx.Response(200, json=_f, request=req)
+                if "flood-api.open-meteo.com/v1/flood" in url:
+                    return httpx.Response(200, json=_g, request=req)
+                if "earthquake.usgs.gov/fdsnws/event/1/query" in url:
+                    return httpx.Response(200, json=_u, request=req)
+                return httpx.Response(404, json={}, request=req)
+
+            with patch("httpx.get", side_effect=_malformed_get):
+                r_tr = self.client.get("/analytics/triggers/1")
+                self.assertEqual(r_tr.status_code, 200)
+                body = r_tr.json()
+                json.dumps(body, allow_nan=False)
+                self.assertTrue(body["provenance"]["fallback_used"])
+                self.assertEqual(len(body["daily_series"]), 14)
+                self.assertGreaterEqual(body["composite_trigger_score"], 0.0)
+                self.assertLessEqual(body["composite_trigger_score"], 100.0)
+
+                r_br = self.client.get("/analytics/breach-simulation/1")
+                self.assertEqual(r_br.status_code, 200)
+                br_body = r_br.json()
+                json.dumps(br_body, allow_nan=False)
+                if exp_elev == 0:
+                    self.assertTrue(br_body["provenance"]["fallback_used"])
+
+            # Verify malformed responses did NOT poison any cache
+            self.assertEqual(len(trigger_engine._FORECAST_CACHE), 0)
+            self.assertEqual(len(trigger_engine._GLOFAS_CACHE), 0)
+            self.assertEqual(len(trigger_engine._USGS_CACHE), exp_usgs)
+            if exp_elev == 0:
+                self.assertEqual(len(elevation_service._ELEV_CACHE), 0)
+
+        # Follow up with healthy response to verify clean recovery
+        with patch("httpx.get", side_effect=make_mock_httpx_get()):
+            r_ok = self.client.get("/analytics/triggers/1")
+            self.assertEqual(r_ok.status_code, 200)
+            self.assertFalse(r_ok.json()["provenance"]["fallback_used"])
+
+    def test_11_breach_stale_cache_provenance_and_compare_dedup(self):
+        from app.services import elevation_service
+
+        # Populate valid cache via online breach simulation, then age all entries to 25h (stale)
+        with patch("httpx.get", side_effect=make_mock_httpx_get()):
+            r_warm = self.client.get("/analytics/breach-simulation/1")
+            self.assertEqual(r_warm.status_code, 200)
+            self.assertFalse(r_warm.json()["provenance"]["fallback_used"])
+
+        stale_ts = time.time() - (25 * 3600)
+        with elevation_service._ELEV_LOCK:
+            for k, (_, val) in list(elevation_service._ELEV_CACHE.items()):
+                elevation_service._ELEV_CACHE[k] = (stale_ts, val)
+
+        with patch("httpx.get", side_effect=httpx.ConnectTimeout("timeout")):
+            r_stale = self.client.get("/analytics/breach-simulation/1")
+        self.assertEqual(r_stale.status_code, 200)
+        prov = r_stale.json()["provenance"]
+        self.assertTrue(prov["fallback_used"])
+        self.assertIn("stale", prov["elevation_source"].lower())
+
+        # Compare deduplication preserving order
+        with patch("httpx.get", side_effect=make_mock_httpx_get()):
+            r_cmp = self.client.get("/analytics/compare?lake_ids=2,2,1,2")
+        self.assertEqual(r_cmp.status_code, 200)
+        self.assertEqual([l["id"] for l in r_cmp.json()["lakes"]], [2, 1])
 
 
 if __name__ == "__main__":

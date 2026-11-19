@@ -78,6 +78,7 @@ export class CdpBrowser {
     this.sameOriginServerErrors = [];
     this.apiResponses = [];
     this._blockedPatterns = [];
+    this._loadWaiters = [];
   }
 
   async launch() {
@@ -209,7 +210,12 @@ export class CdpBrowser {
     const method = msg.method;
     const params = msg.params || {};
 
-    if (method === 'Page.javascriptDialogOpening') {
+    if (method === 'Page.loadEventFired') {
+      const waiters = this._loadWaiters.splice(0, this._loadWaiters.length);
+      for (const resolve of waiters) {
+        resolve();
+      }
+    } else if (method === 'Page.javascriptDialogOpening') {
       this.dialogs.push({
         type: params.type,
         message: params.message,
@@ -339,7 +345,20 @@ export class CdpBrowser {
   }
 
   async goto(url, { timeoutMs = 30000 } = {}) {
+    const loadPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this._loadWaiters.indexOf(onLoad);
+        if (idx >= 0) this._loadWaiters.splice(idx, 1);
+        reject(new Error(`Timed out waiting for Page.loadEventFired (${url})`));
+      }, timeoutMs);
+      const onLoad = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      this._loadWaiters.push(onLoad);
+    });
     await this.send('Page.navigate', { url });
+    await loadPromise;
     await this.waitFor(
       () => document.readyState === 'complete',
       [],
@@ -348,7 +367,20 @@ export class CdpBrowser {
   }
 
   async reload({ timeoutMs = 30000 } = {}) {
+    const loadPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this._loadWaiters.indexOf(onLoad);
+        if (idx >= 0) this._loadWaiters.splice(idx, 1);
+        reject(new Error('Timed out waiting for Page.loadEventFired on reload'));
+      }, timeoutMs);
+      const onLoad = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      this._loadWaiters.push(onLoad);
+    });
     await this.send('Page.reload', { ignoreCache: false });
+    await loadPromise;
     await this.waitFor(
       () => document.readyState === 'complete',
       [],
@@ -475,7 +507,7 @@ export class CdpBrowser {
   }
 
   async clickByText(selector, patternStr, { timeoutMs = 15000, flags = 'i', exact = false } = {}) {
-    const box = await this.waitFor(
+    await this.waitFor(
       (sel, pat, fl, isExact) => {
         const re = new RegExp(pat, fl);
         const els = Array.from(document.querySelectorAll(sel));
@@ -486,14 +518,33 @@ export class CdpBrowser {
           const r = el.getBoundingClientRect();
           if (r.width <= 0 || r.height <= 0) continue;
           el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-          const r2 = el.getBoundingClientRect();
-          return { x: r2.left + r2.width / 2, y: r2.top + r2.height / 2 };
+          return true;
         }
-        return null;
+        return false;
       },
       [selector, patternStr, flags, exact],
       { timeoutMs, label: `${selector} matching "${patternStr}"` },
     );
+    await sleep(60);
+    const box = await this.evaluate(
+      (sel, pat, fl, isExact) => {
+        const re = new RegExp(pat, fl);
+        const els = Array.from(document.querySelectorAll(sel));
+        for (const el of els) {
+          const text = (el.innerText || el.textContent || '').trim();
+          const matched = isExact ? text === pat : re.test(text);
+          if (!matched) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) continue;
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        }
+        return null;
+      },
+      [selector, patternStr, flags, exact],
+    );
+    if (!box) {
+      throw new Error(`Element disappeared before click: ${selector} matching "${patternStr}"`);
+    }
     await this.clickPoint(box.x, box.y);
   }
 
